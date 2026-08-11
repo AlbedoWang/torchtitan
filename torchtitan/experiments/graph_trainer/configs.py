@@ -169,6 +169,15 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Use AutoParallelGraph (ILP solver-based SPMD sharding) instead of
     manual TP/FSDP/EP. Forces the AOT compilation path internally."""
 
+    autoparallel_solver: Literal["ilp", "approx", "lp"] = "ilp"
+    """Placement solver used by AutoParallel."""
+
+    autoparallel_placements_save_path: str = ""
+    """Save solved AutoParallel placements to this JSON path."""
+
+    autoparallel_placements_load_path: str = ""
+    """Load AutoParallel placements from this JSON path and skip solving."""
+
 
 def validate_autoparallel_config(
     compile_config: GraphTrainerCompileConfig,
@@ -177,6 +186,20 @@ def validate_autoparallel_config(
         raise ValueError(
             "AutoParallel graph_trainer integration only supports "
             "--compile.mode aot_fx_trace"
+        )
+    if (
+        compile_config.autoparallel_placements_save_path
+        and compile_config.autoparallel_placements_load_path
+    ):
+        raise ValueError(
+            "AutoParallel placement save and load paths are mutually exclusive"
+        )
+    if not compile_config.enable_autoparallel and (
+        compile_config.autoparallel_placements_save_path
+        or compile_config.autoparallel_placements_load_path
+    ):
+        raise ValueError(
+            "AutoParallel placement paths require --compile.enable_autoparallel"
         )
 
 

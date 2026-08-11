@@ -698,7 +698,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     positions=positions,
                 )
 
-        if self.parallel_dims.cp_enabled:
+        if self._context_parallel_input_enabled():
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
                 inputs,
                 labels,
@@ -726,6 +726,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
 
         return inputs, labels, extra_kwargs
+
+    def _context_parallel_input_enabled(self) -> bool:
+        return self.parallel_dims.cp_enabled
+
+    def _metrics_loss_mesh(self):
+        return self.parallel_dims.get_optional_mesh("loss")
 
     @sl.log_trace_span("fwd_bwd")
     def forward_backward_step(
@@ -895,7 +901,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             if parallel_dims.dp_cp_enabled:
                 loss = loss.detach()
-                loss_mesh = parallel_dims.get_optional_mesh("loss")
+                loss_mesh = self._metrics_loss_mesh()
 
                 # For global_avg_loss, we want the average loss across all ranks:
                 # loss = local_loss_sum / global_valid_tokens

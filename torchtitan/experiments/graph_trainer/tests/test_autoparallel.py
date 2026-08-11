@@ -29,19 +29,31 @@ class _FakeMesh:
 
 
 class _FakeParallelDims:
-    dp_replicate_enabled = False
-    cp_enabled = False
     pp_enabled = False
-    tp_enabled = True
-    dp_replicate = 1
-    dp_shard = 2
 
-    def __init__(self, *, sparse: bool = False):
+    def __init__(
+        self,
+        *,
+        sparse: bool = False,
+        generic_3d: bool = False,
+        moe_3d: bool = False,
+    ):
         self.sparse = sparse
-        self.tp_enabled = not sparse
+        self.generic_3d = generic_3d
+        self.moe_3d = moe_3d
+        self.tp_enabled = not sparse or moe_3d
+        self.dp_replicate_enabled = generic_3d
+        self.cp_enabled = generic_3d or moe_3d
+        self.dp_replicate = 2 if generic_3d else 1
+        self.dp_shard = 1 if generic_3d else 2
+        self.cp = 2 if self.cp_enabled else 1
+        self.tp = 2 if self.tp_enabled else 1
+        self.ep = 4 if moe_3d else 2
 
     def get_optional_mesh(self, name):
-        enabled = {"fsdp", "tp"} if not self.sparse else {"efsdp", "ep"}
+        enabled = {"dp_replicate", "fsdp", "tp"} if self.generic_3d else {"fsdp", "tp"}
+        if self.sparse:
+            enabled = {"efsdp", "ep"}
         return _FakeMesh((name,)) if name in enabled else None
 
     def get_mesh(self, names):
@@ -55,8 +67,14 @@ class _FakeAutoParallelGraph:
 
     def __init__(self, model, input_fn, mesh, **kwargs):
         self.model = model
+        self.mesh = mesh
         self.kwargs = kwargs
         self.used_fx_path = False
+        self.optimize_calls = 0
+        self.sharding_optimizer = SimpleNamespace(
+            load_placements=self._load_placements,
+            save_placements=self._save_placements,
+        )
         _FakeAutoParallelGraph.instances.append(self)
 
     def __enter__(self):
@@ -69,13 +87,21 @@ class _FakeAutoParallelGraph:
         pass
 
     def add_input_constraints(self, constraints):
-        pass
+        self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
-        pass
+        self.output_constraints = constraints
 
     def optimize_placement(self, verbose=False):
+        self.optimize_calls += 1
         return object()
+
+    def _load_placements(self, path):
+        self.loaded_path = path
+        return object()
+
+    def _save_placements(self, path):
+        self.saved_path = path
 
     def apply_placement_for_fx_module(self, *args, **kwargs):
         self.used_fx_path = True
@@ -127,6 +153,22 @@ def test_autoparallel_config_validation():
     )
     validate_autoparallel_config(compile_config)
 
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate_autoparallel_config(
+            GraphTrainerCompileConfig(
+                enable_autoparallel=True,
+                autoparallel_placements_save_path="save.json",
+                autoparallel_placements_load_path="load.json",
+            )
+        )
+
+    with pytest.raises(ValueError, match="require --compile.enable_autoparallel"):
+        validate_autoparallel_config(
+            GraphTrainerCompileConfig(
+                autoparallel_placements_load_path="load.json",
+            )
+        )
+
 
 def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
     from torchtitan.experiments.graph_trainer import passes
@@ -176,7 +218,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     expected_reshard_after_forward,
 ):
     class FakeDeepSeekV3Model(torch.nn.Module):
-        def __init__(self, config, *, mesh, compute_dtype):
+        def __init__(self, config, *, mesh, roles, compute_dtype):
             super().__init__()
             self.model_args = SimpleNamespace(vocab_size=16)
 
@@ -208,7 +250,18 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
             patch.object(
                 parallelize_autoparallel,
                 "_load_autoparallel_dsv3_dependency",
-                return_value=(FakeDeepSeekV3Model, lambda model: None),
+                return_value=(
+                    FakeDeepSeekV3Model,
+                    lambda model: None,
+                    lambda **kwargs: (
+                        _FakeMesh(("dp_shard_in_ep",)),
+                        SimpleNamespace(
+                            ep_axis_names=("dp_shard_in_ep",),
+                            ep_group_name="dp_shard_in_ep",
+                        ),
+                    ),
+                    lambda **kwargs: None,
+                ),
             ),
         )
 
@@ -226,6 +279,8 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
         for extra_patch in extra_patches:
             stack.enter_context(extra_patch)
 
+        if model_name == "deepseek":
+            model.config.rope = object()
         call_parallelize(
             model,
             parallel_dims=parallel_dims,
@@ -244,3 +299,170 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert autop.kwargs.get("dynamic", False) is (model_name == "deepseek")
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path
+
+
+@pytest.mark.parametrize("use_saved_placements", [False, True])
+def test_llama_3d_autoparallel_constraints_and_placement_io(
+    tmp_path, use_saved_placements
+):
+    from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
+
+    _FakeAutoParallelGraph.instances.clear()
+    placement_path = tmp_path / "placements.json"
+    compile_config = GraphTrainerCompileConfig(
+        enable_autoparallel=True,
+        autoparallel_solver="approx",
+        autoparallel_placements_load_path=(
+            str(placement_path) if use_saved_placements else ""
+        ),
+        autoparallel_placements_save_path=(
+            "" if use_saved_placements else str(placement_path)
+        ),
+    )
+
+    with (
+        patch.object(
+            parallelize_autoparallel, "AutoParallelGraph", _FakeAutoParallelGraph
+        ),
+        patch.object(
+            parallelize_autoparallel, "apply_compile", lambda model, **_: model
+        ),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_llama(
+            SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
+            parallel_dims=_FakeParallelDims(generic_3d=True),
+            training=_training_config(),
+            parallelism=ParallelismConfig(),
+            compile_config=compile_config,
+            ac_config=object(),
+            dump_folder="",
+        )
+
+    autop = _FakeAutoParallelGraph.instances[0]
+    expected = (torch.distributed.tensor.Shard(0),) + (
+        torch.distributed.tensor.Replicate(),
+    ) * 2
+    assert autop.kwargs["solver"] == "approx"
+    assert autop.kwargs["strategy_radius"] == (0 if use_saved_placements else 2)
+    assert autop.input_constraints == [expected, expected]
+    assert autop.output_constraints == [expected]
+    assert autop.apply_kwargs["model_output"] is None
+    if use_saved_placements:
+        assert autop.optimize_calls == 0
+        assert autop.loaded_path == str(placement_path)
+    else:
+        assert autop.optimize_calls == 1
+        assert autop.saved_path == placement_path
+
+
+@pytest.mark.parametrize("use_saved_placements", [False, True])
+def test_deepseek_v3_3d_folded_ep_constraints_and_placement_io(
+    tmp_path, use_saved_placements
+):
+    from torchtitan.experiments.graph_trainer.deepseek_v3 import (
+        parallelize_autoparallel,
+    )
+
+    model_init = {}
+    mesh_build = {}
+    moe_roles = SimpleNamespace(ep_axis_names=("cp", "tp"), ep_group_name="ep")
+    ap_mesh = _FakeMesh(("dp_shard_mod_ep", "cp", "tp"), size=8)
+
+    class FakeDeepSeekV3Model(torch.nn.Module):
+        def __init__(self, config, *, mesh, roles, compute_dtype):
+            super().__init__()
+            self.model_args = SimpleNamespace(vocab_size=16)
+            model_init.update(mesh=mesh, roles=roles, compute_dtype=compute_dtype)
+
+    def fake_build_moe_mesh(**kwargs):
+        mesh_build.update(kwargs)
+        return ap_mesh, moe_roles
+
+    _FakeAutoParallelGraph.instances.clear()
+    placement_path = tmp_path / "placements.json"
+    compile_config = GraphTrainerCompileConfig(
+        enable_autoparallel=True,
+        autoparallel_solver="approx",
+        autoparallel_placements_load_path=(
+            str(placement_path) if use_saved_placements else ""
+        ),
+        autoparallel_placements_save_path=(
+            "" if use_saved_placements else str(placement_path)
+        ),
+    )
+
+    with (
+        patch.object(
+            parallelize_autoparallel,
+            "_load_autoparallel_dsv3_dependency",
+            return_value=(
+                FakeDeepSeekV3Model,
+                lambda model: None,
+                fake_build_moe_mesh,
+                lambda **kwargs: None,
+            ),
+        ),
+        patch.object(
+            parallelize_autoparallel, "AutoParallelGraph", _FakeAutoParallelGraph
+        ),
+        patch.object(
+            parallelize_autoparallel, "apply_compile", lambda model, **_: model
+        ),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_deepseekv3(
+            SimpleNamespace(config=SimpleNamespace(rope=object())),
+            parallel_dims=_FakeParallelDims(sparse=True, moe_3d=True),
+            training=_training_config(),
+            parallelism=ParallelismConfig(),
+            compile_config=compile_config,
+            ac_config=object(),
+            dump_folder="",
+        )
+
+    assert {
+        k: mesh_build[k] for k in ("dp_replicate", "dp_shard", "cp", "tp", "ep")
+    } == {
+        "dp_replicate": 1,
+        "dp_shard": 2,
+        "cp": 2,
+        "tp": 2,
+        "ep": 4,
+    }
+    assert model_init["mesh"] is ap_mesh
+    assert model_init["roles"] is moe_roles
+
+    autop = _FakeAutoParallelGraph.instances[0]
+    expected = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Replicate(),
+        torch.distributed.tensor.Replicate(),
+    )
+    assert autop.mesh is ap_mesh
+    assert autop.kwargs["solver"] == "approx"
+    assert autop.kwargs["strategy_radius"] == (0 if use_saved_placements else 2)
+    assert autop.kwargs["dynamic"] is True
+    assert autop.input_constraints == [expected]
+    assert autop.output_constraints == [expected]
+    if use_saved_placements:
+        assert autop.optimize_calls == 0
+        assert autop.loaded_path == str(placement_path)
+    else:
+        assert autop.optimize_calls == 1
+        assert autop.saved_path == placement_path
+
+
+def test_graph_trainer_autoparallel_owns_cp_input_and_metrics_mesh():
+    from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+
+    batch_mesh = object()
+    trainer = object.__new__(GraphTrainer)
+    trainer.config = SimpleNamespace(
+        compile=GraphTrainerCompileConfig(enable_autoparallel=True)
+    )
+    trainer.parallel_dims = SimpleNamespace(
+        cp_enabled=True,
+        get_optional_mesh=lambda name: batch_mesh if name == "batch" else object(),
+    )
+
+    assert trainer._context_parallel_input_enabled() is False
+    assert trainer._metrics_loss_mesh() is batch_mesh

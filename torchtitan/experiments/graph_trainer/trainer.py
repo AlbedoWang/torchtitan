@@ -126,6 +126,17 @@ class GraphTrainer(Trainer):
         # Run post-init hook for the active pass pipeline
         POST_INIT_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(self)
 
+    def _context_parallel_input_enabled(self) -> bool:
+        return (
+            super()._context_parallel_input_enabled()
+            and not self.config.compile.enable_autoparallel
+        )
+
+    def _metrics_loss_mesh(self):
+        if self.config.compile.enable_autoparallel and self.parallel_dims.cp_enabled:
+            return self.parallel_dims.get_optional_mesh("batch")
+        return super()._metrics_loss_mesh()
+
     def forward_backward_step(
         self,
         *,

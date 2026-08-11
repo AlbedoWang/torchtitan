@@ -34,6 +34,12 @@ def graph_trainer_deepseek_v3_debugmodel() -> GraphTrainer.Config:
     return config
 
 
+def graph_trainer_deepseek_v3_debugmodel_sdpa() -> GraphTrainer.Config:
+    config = graph_trainer_deepseek_v3_debugmodel()
+    config.model_spec = model_registry("debugmodel", attn_backend="sdpa")
+    return config
+
+
 def graph_trainer_deepseek_v3_debugmodel_mxfp8() -> GraphTrainer.Config:
     base = deepseek_v3_debugmodel()
     # Quantize dense and moe gemms to mxfp8

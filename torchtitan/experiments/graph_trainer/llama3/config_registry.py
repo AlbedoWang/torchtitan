@@ -75,6 +75,19 @@ def graph_trainer_llama3_8b() -> GraphTrainer.Config:
     return config
 
 
+def graph_trainer_llama3_8b_sdpa_cross_entropy_loss() -> GraphTrainer.Config:
+    """Llama 3 8B with traceable SDPA and standard cross-entropy loss."""
+    base = llama3_8b()
+    base.model_spec = model_registry("8B", attn_backend="sdpa")
+    config = to_graph_trainer_config(base, model_registry)
+    assert config.model_spec is not None
+    config.loss = CrossEntropyLoss.Config(
+        global_vocab_size=decoder_vocab_size(config.model_spec),
+    )
+    config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
 def graph_trainer_llama3_8b_mxfp8() -> GraphTrainer.Config:
     base = llama3_8b()
     # Swap dense Linear layers for MXFP8Linear before wrapping in the
