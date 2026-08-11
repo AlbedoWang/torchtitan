@@ -138,6 +138,22 @@ def test_autoparallel_integration_matrix():
     assert all(test.ngpu == 4 for tests in suites.values() for test in tests)
 
 
+def test_deepseek_v3_autoparallel_config_uses_sdpa_and_standard_loss():
+    from torchtitan.components.loss import CrossEntropyLoss
+    from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
+        graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss,
+    )
+    from torchtitan.models.common.attention import ScaledDotProductAttention
+
+    config = graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss()
+
+    assert isinstance(config.loss, CrossEntropyLoss.Config)
+    assert {
+        type(layer.attention.inner_attention)
+        for layer in config.model_spec.model.layers
+    } == {ScaledDotProductAttention.Config}
+
+
 def test_autoparallel_config_validation():
     with pytest.raises(ValueError, match="only supports --compile.mode aot_fx_trace"):
         validate_autoparallel_config(
