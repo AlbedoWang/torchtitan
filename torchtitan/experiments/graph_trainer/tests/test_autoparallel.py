@@ -154,6 +154,46 @@ def test_deepseek_v3_autoparallel_config_uses_sdpa_and_standard_loss():
     } == {ScaledDotProductAttention.Config}
 
 
+def test_deepseek_v3_ap_moe_implements_optimizer_hook_contract():
+    from autoparallel.cast_parametrization import apply_dtype_cast
+    from autoparallel._testing.models.dsv3 import (
+        DeepSeekV3Model,
+        make_dsv3_config,
+    )
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
+        graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss,
+    )
+    from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize_autoparallel import (
+        _preserve_moe_attributes,
+        _to_autoparallel_dsv3_config,
+    )
+
+    config = graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss()
+    with torch.device("meta"):
+        original_model = config.model_spec.model.build()
+        ap_config = _to_autoparallel_dsv3_config(
+            original_model.config, make_dsv3_config
+        )
+        ap_model = DeepSeekV3Model(ap_config)
+    ap_model = apply_dtype_cast(
+        ap_model,
+        MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        ),
+    )
+
+    _preserve_moe_attributes(original_model, ap_model)
+    ap_moes = [block.moe for block in ap_model.layers.values() if block.moe_enabled]
+
+    assert ap_moes
+    assert {type(moe).__name__ for moe in ap_moes} == {"DTypeCastMoE"}
+    for moe in ap_moes:
+        assert moe.tokens_per_expert_E is moe.tokens_per_expert
+        assert moe.expert_bias_E is moe.expert_bias
+
+
 def test_autoparallel_config_validation():
     with pytest.raises(ValueError, match="only supports --compile.mode aot_fx_trace"):
         validate_autoparallel_config(

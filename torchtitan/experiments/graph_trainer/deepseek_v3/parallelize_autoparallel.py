@@ -149,7 +149,7 @@ def _set_torchtitan_fields(parallel_model):
 
 
 def _preserve_moe_attributes(original_model, parallel_model):
-    """Preserve MoE attributes (moe_enabled, load_balance_coeff) from original."""
+    """Adapt AP MoE modules to TorchTitan's optimizer-hook contract."""
 
     def get_moe_modules(model):
         moe_modules = []
@@ -171,6 +171,12 @@ def _preserve_moe_attributes(original_model, parallel_model):
             par_moe.moe_enabled = orig_moe.moe_enabled
         if hasattr(orig_moe, "load_balance_coeff"):
             par_moe.load_balance_coeff = orig_moe.load_balance_coeff
+        # AP uses the unsuffixed names in its traced graph. TorchTitan's
+        # auxiliary-loss-free expert-bias optimizer hook uses the equivalent
+        # _E names. Keep one tensor for each statistic/bias so the hook updates
+        # the same buffers consumed by AP's forward.
+        par_moe.tokens_per_expert_E = par_moe.tokens_per_expert
+        par_moe.expert_bias_E = par_moe.expert_bias
 
 
 def parallelize_autoparallel_deepseekv3(
