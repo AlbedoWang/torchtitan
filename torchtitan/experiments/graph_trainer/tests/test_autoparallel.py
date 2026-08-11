@@ -133,9 +133,11 @@ def test_autoparallel_integration_matrix():
         "autoparallel_llama3_fsdp_tp"
     ]
     assert [test.test_name for test in suites["h100"]] == [
-        "autoparallel_deepseek_v3_efsdp_ep"
+        "autoparallel_deepseek_v3_dp_cp_tp_folded_ep"
     ]
-    assert all(test.ngpu == 4 for tests in suites.values() for test in tests)
+    assert suites["default"][0].ngpu == 4
+    assert suites["h100"][0].ngpu == 8
+    assert suites["h100"][0].disabled is False
 
 
 def test_deepseek_v3_autoparallel_config_uses_sdpa_and_standard_loss():
