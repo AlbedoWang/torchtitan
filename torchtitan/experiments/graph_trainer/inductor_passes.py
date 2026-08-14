@@ -230,6 +230,7 @@ def full_inductor_compilation_pass(
     example_inputs: tuple,
     *,
     boxed_codegen: bool = False,
+    inductor_configs: dict | None = None,
 ) -> torch.fx.GraphModule:
     """Apply full Inductor compilation by tagging every node and delegating
     to :func:`regional_inductor_pass`.
@@ -256,6 +257,8 @@ def full_inductor_compilation_pass(
         example_inputs: Example inputs for shape propagation.
         boxed_codegen: When True, the returned FX graph uses boxed calling
             convention and clears its mutable runtime arg list.
+        inductor_configs: Optional settings applied to the full standalone
+            Inductor compile. Existing per-node settings must not conflict.
     """
     import torch._inductor.config as ic
 
@@ -271,9 +274,22 @@ def full_inductor_compilation_pass(
         for node in module.graph.nodes:
             if node.op in ("placeholder", "output"):
                 continue
-            node.meta.setdefault("custom", {}).setdefault(
+            custom = node.meta.setdefault("custom", {})
+            annotation = custom.setdefault(
                 "compile_with_inductor", {"inductor_configs": {}}
             )
+            if not isinstance(annotation, dict):
+                raise ValueError("compile_with_inductor annotation must be a dict")
+            existing_configs = annotation.setdefault("inductor_configs", {})
+            if not isinstance(existing_configs, dict):
+                raise ValueError("inductor_configs annotation must be a dict")
+            for key, value in (inductor_configs or {}).items():
+                if key in existing_configs and existing_configs[key] != value:
+                    raise ValueError(
+                        f"Conflicting full Inductor config for {key!r}: "
+                        f"{existing_configs[key]!r} != {value!r}"
+                    )
+                existing_configs[key] = value
     # AOT autograd (via ``standalone_compile``) reorders the gm and breaks
     # fwd/bwd interleaving, blowing up the baseline schedule. Re-enable
     # Inductor's reorder pass (disabled globally in ``compile.py``) to fix.

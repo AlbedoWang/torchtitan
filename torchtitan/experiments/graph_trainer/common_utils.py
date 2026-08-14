@@ -167,9 +167,18 @@ def accumulate_param_grads_(
     grads: Iterable[torch.Tensor | None],
 ) -> None:
     """Accumulate explicit graph-produced gradients into live parameters."""
+    accumulated_param_ids: set[int] = set()
     for param, grad in zip(params, grads, strict=True):
         if grad is None:
             continue
+        # ``minimal_fx_tracer`` keeps one state entry per FQN. Tied parameters
+        # therefore occur more than once in ``params``, and autograd returns the
+        # same complete gradient for every alias. Accumulate that gradient once,
+        # matching Tensor.backward() on the live, tied parameter object.
+        param_id = id(param)
+        if param_id in accumulated_param_ids:
+            continue
+        accumulated_param_ids.add(param_id)
         grad = _maybe_materialize_grad_for_param_layout(param, grad)
         if param.grad is None:
             param.grad = grad

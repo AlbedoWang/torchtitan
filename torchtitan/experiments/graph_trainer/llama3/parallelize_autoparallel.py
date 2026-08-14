@@ -15,6 +15,7 @@ graph_trainer trace and compile the placed model through its normal
 import time
 
 import torch
+from autoparallel import ForwardInputs
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -80,10 +81,10 @@ def parallelize_autoparallel_llama(
         )
         positions = torch.arange(
             training.seq_len,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=torch.device(device_type),
         ).repeat(global_batch_size, 1)
-        return tokens, positions
+        return ForwardInputs(args=(tokens,), kwargs={"positions": positions})
 
     param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
     reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
