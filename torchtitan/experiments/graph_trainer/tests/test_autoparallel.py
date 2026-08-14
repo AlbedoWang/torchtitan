@@ -205,46 +205,48 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
     assert custom_pass.keywords["configs"].custom_runtime_estimation is not None
 
 
-def test_autoparallel_sac_saves_forward_collectives_only():
+def test_autoparallel_uses_eager_sac_collective_policy():
     from torchtitan.experiments.graph_trainer.memory_policy import (
-        _save_autoparallel_collectives,
+        tag_with_memory_policy_pass,
     )
 
-    graph = torch.fx.Graph()
-    tensor = graph.placeholder("tensor")
-    all_gather = graph.call_function(
-        torch.ops._c10d_functional.all_gather_into_tensor.default,
-        args=(tensor, 2, "group"),
-    )
-    wait = graph.call_function(
-        torch.ops._c10d_functional.wait_tensor.default,
-        args=(all_gather,),
-    )
-    all_to_all = graph.call_function(
-        torch.ops._dtensor.shard_dim_alltoall.default,
-        args=(wait, 0, 0, "group"),
-    )
-    backward_all_gather = graph.call_function(
-        torch.ops._c10d_functional.all_gather_into_tensor.default,
-        args=(all_to_all, 2, "group"),
-    )
-    untagged_all_gather = graph.call_function(
-        torch.ops._c10d_functional.all_gather_into_tensor.default,
-        args=(backward_all_gather, 2, "group"),
-    )
-    graph.output(untagged_all_gather)
+    def apply_policy(*, enable_autoparallel):
+        graph = torch.fx.Graph()
+        tensor = graph.placeholder("tensor")
+        all_gather = graph.call_function(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            args=(tensor, 2, "group"),
+        )
+        wait = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(all_gather,),
+        )
+        graph.output(wait)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        config = SimpleNamespace(
+            compile=SimpleNamespace(
+                enable_autoparallel=enable_autoparallel,
+                memory_policy="eager",
+            )
+        )
 
-    for node in (all_gather, wait, all_to_all, backward_all_gather):
-        node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
-    backward_all_gather.meta["autograd_backward"] = True
+        tag_with_memory_policy_pass(gm, config=config)
+        return {
+            node.target: node.meta.get("recompute")
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+        }
 
-    _save_autoparallel_collectives(SimpleNamespace(graph=graph))
+    regular_policy = apply_policy(enable_autoparallel=False)
+    autoparallel_policy = apply_policy(enable_autoparallel=True)
 
-    assert all_gather.meta["recompute"] is CheckpointPolicy.MUST_SAVE
-    assert wait.meta["recompute"] is CheckpointPolicy.MUST_SAVE
-    assert all_to_all.meta["recompute"] is CheckpointPolicy.MUST_SAVE
-    assert backward_all_gather.meta["recompute"] is CheckpointPolicy.PREFER_RECOMPUTE
-    assert "recompute" not in untagged_all_gather.meta
+    assert autoparallel_policy == regular_policy
+    assert (
+        autoparallel_policy[
+            torch.ops._c10d_functional.all_gather_into_tensor.default
+        ]
+        is CheckpointPolicy.PREFER_RECOMPUTE
+    )
 
 
 def test_autoparallel_graph_preserves_copied_model_fqns():
