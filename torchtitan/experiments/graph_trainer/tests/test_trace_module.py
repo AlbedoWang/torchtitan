@@ -18,6 +18,7 @@ from torchtitan.experiments.graph_trainer.chunked_loss import (
 )
 from torchtitan.experiments.graph_trainer.common_utils import (
     _maybe_materialize_grad_for_param_layout,
+    accumulate_param_grads_,
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -1156,6 +1157,58 @@ class TestTraceDTensor(unittest.TestCase):
         self.assertTrue(torch.equal(loss_ref.full_tensor(), loss_tr.full_tensor()))
         for gr, gt in zip(grads_ref, grads_tr, strict=True):
             self.assertTrue(torch.equal(gr.full_tensor(), gt.full_tensor()))
+
+    def test_tied_dtensor_train_step(self):
+        from torch.distributed._tensor import distribute_tensor, DTensor, Replicate
+        from torch.distributed.device_mesh import init_device_mesh
+
+        mesh = init_device_mesh(self.DEVICE, (1,))
+        device = self.DEVICE
+
+        class TiedLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                shared = nn.Parameter(
+                    distribute_tensor(
+                        torch.randn(4, 4, device=device),
+                        mesh,
+                        [Replicate()],
+                    )
+                )
+                self.input = nn.Linear(4, 4, bias=False, device=device)
+                self.output = nn.Linear(4, 4, bias=False, device=device)
+                self.input.weight = shared
+                self.output.weight = shared
+
+            def forward(self, x):
+                return self.input(x)
+
+        model = TiedLinear()
+        inputs = DTensor.from_local(
+            torch.randn(2, 4, device=self.DEVICE), mesh, [Replicate()]
+        )
+
+        def train_step(inputs):
+            loss = model(inputs).sum()
+            params = [p for _, p in model.named_parameters(remove_duplicate=False)]
+            return [loss, *torch.autograd.grad(loss, params)]
+
+        self.assertIs(model.input.weight, model.output.weight)
+        eager = train_step(inputs)
+        traced = minimal_fx_tracer(train_step, module=model)(inputs)
+        actual = run_traced(traced, module=model)(inputs)
+
+        self.assertEqual(traced.state_fqns, ["input.weight", "output.weight"])
+        for expected_value, actual_value in zip(eager, actual, strict=True):
+            torch.testing.assert_close(
+                expected_value.full_tensor(), actual_value.full_tensor()
+            )
+
+        params = [p for _, p in model.named_parameters(remove_duplicate=False)]
+        accumulate_param_grads_(params, actual[1:])
+        torch.testing.assert_close(
+            model.input.weight.grad.full_tensor(), eager[1].full_tensor()
+        )
 
     def test_full_inductor_pass_on_collective(self):
         # ``make_fx`` traces ``dist.*`` collectives as raw ``c10d.{op}_``

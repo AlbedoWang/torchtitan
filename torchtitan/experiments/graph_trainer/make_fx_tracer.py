@@ -244,6 +244,30 @@ def _check_optimizer_has_module(
         )
 
 
+def _preserve_module_state_aliases(
+    module: nn.Module, model_state: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Restore parameter/buffer aliases after subclass rewrapping.
+
+    A tied tensor appears once per FQN in ``model_state``.  Tensor subclasses
+    are unwrapped and rewrapped independently by the tracer, so two FQNs that
+    referred to the same DTensor can otherwise become distinct DTensor objects.
+    Reuse the first traced value for every FQN that aliases the same live module
+    tensor, matching the module state that was originally extracted.
+    """
+    original_state = extract_module_state(module)
+    traced_value_by_original_id: dict[int, torch.Tensor] = {}
+    aliased_state = model_state.copy()
+    for name, original_value in original_state.items():
+        if name not in model_state:
+            continue
+        original_id = id(original_value)
+        if original_id not in traced_value_by_original_id:
+            traced_value_by_original_id[original_id] = model_state[name]
+        aliased_state[name] = traced_value_by_original_id[original_id]
+    return aliased_state
+
+
 @contextlib.contextmanager
 def _reparametrize_train_state(
     module: nn.Module | None,
@@ -253,6 +277,8 @@ def _reparametrize_train_state(
 ):
     """Reparametrize module and optimizer with explicit tensor state for tracing."""
     with contextlib.ExitStack() as stack:
+        if module is not None:
+            model_state = _preserve_module_state_aliases(module, model_state)
         if optimizer is not None:
             # swap_in pairs values positionally in optimizer.param_groups flat
             # order, which differs from named_parameters() order for bucketed
@@ -272,7 +298,9 @@ def _reparametrize_train_state(
                 )
             )
         if module is not None:
-            stack.enter_context(stateless._reparametrize_module(module, model_state))
+            stack.enter_context(
+                stateless._reparametrize_module(module, model_state, tie_weights=True)
+            )
         yield
 
 
@@ -324,9 +352,11 @@ class TracedResult:
         """
         num_state = len(self.state_fqns)
         return sum(
-            self.input_subclass_layouts[i].num_tensors
-            if i in self.input_subclass_layouts
-            else 1
+            (
+                self.input_subclass_layouts[i].num_tensors
+                if i in self.input_subclass_layouts
+                else 1
+            )
             for i in range(num_state)
         )
 
@@ -337,11 +367,13 @@ def minimal_fx_tracer(
     optimizer: "torch.optim.Optimizer | None" = None,
     *,
     prepare_inputs: Callable[[tuple[Any, ...], dict[str, Any]], None] | None = None,
-    prepare_call_inputs: Callable[
-        [tuple[Any, ...], dict[str, Any]],
-        tuple[tuple[Any, ...], dict[str, Any]] | None,
-    ]
-    | None = None,
+    prepare_call_inputs: (
+        Callable[
+            [tuple[Any, ...], dict[str, Any]],
+            tuple[tuple[Any, ...], dict[str, Any]] | None,
+        ]
+        | None
+    ) = None,
     _insert_runtime_asserts: bool = False,
 ) -> Callable[..., TracedResult]:
     """Return a tracer that captures ``fn`` with implicit module/optimizer state.
@@ -430,9 +462,11 @@ def minimal_fx_tracer(
             shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
         )
         fake_args = tuple(
-            _fakeify_input(fake_mode, a, input_name=f"input_{i}")
-            if isinstance(a, torch.Tensor)
-            else a
+            (
+                _fakeify_input(fake_mode, a, input_name=f"input_{i}")
+                if isinstance(a, torch.Tensor)
+                else a
+            )
             for i, a in enumerate(unwrapped_args)
         )
 
@@ -459,9 +493,12 @@ def minimal_fx_tracer(
                 if prepared is not None:
                     user_args, user_kwargs = prepared
 
-            with _reparametrize_train_state(
-                module, optimizer, model_state_t, optim_state_t
-            ), torch.compiler._patch_engine_backward():
+            with (
+                _reparametrize_train_state(
+                    module, optimizer, model_state_t, optim_state_t
+                ),
+                torch.compiler._patch_engine_backward(),
+            ):
                 result = fn(*user_args, **user_kwargs)
 
             flat_outs, output_spec = pytree.tree_flatten(result)

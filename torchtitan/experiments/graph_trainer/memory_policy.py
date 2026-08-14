@@ -125,6 +125,39 @@ def _make_eager_memory_policy(save_ops: set | None = None) -> Callable:
     return policy_fn
 
 
+def _save_autoparallel_collectives(gm: torch.fx.GraphModule) -> None:
+    """Keep AutoParallel communication out of SAC recomputation.
+
+    AutoParallel's AOT partitioner saves collective results selected by its
+    first partition while recomputing downstream compute.  GraphTrainer has
+    an explicit forward/backward graph, so replaying a collective here would
+    add a third communication chain on top of the traced forward and backward
+    chains.  Save the collective (and an immediate wait) so remat starts from
+    the communicated value instead.
+    """
+    collective_targets = {
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
+        torch.ops._dtensor.shard_dim_alltoall.default,
+    }
+    saved = 0
+    for node in gm.graph.nodes:
+        if (
+            "recompute" not in node.meta
+            or _is_backward_node(node)
+            or node.target not in collective_targets
+        ):
+            continue
+        node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        saved += 1
+        for user in node.users:
+            if (
+                "recompute" in user.meta
+                and user.target is torch.ops._c10d_functional.wait_tensor.default
+            ):
+                user.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+    logger.info("Forced %d AutoParallel collective nodes to MUST_SAVE", saved)
+
+
 def tag_sac_policy(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -351,5 +384,7 @@ def tag_with_memory_policy_pass(
             f"Available: {list(MEMORY_POLICY_REGISTRY.keys())}"
         )
     gm = MEMORY_POLICY_REGISTRY[memory_policy](gm, config=config)
+    if config.compile.enable_autoparallel:
+        _save_autoparallel_collectives(gm)
     log_activation_memory_policy(gm)
     return gm

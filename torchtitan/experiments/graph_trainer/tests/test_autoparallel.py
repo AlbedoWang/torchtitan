@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.graph_trainer.configs import (
@@ -20,6 +21,7 @@ from torchtitan.experiments.graph_trainer.configs import (
 
 class _FakeMesh:
     def __init__(self, mesh_axis_names, size=2):
+        self.device_type = "cpu"
         self.mesh_dim_names = tuple(mesh_axis_names)
         self.ndim = len(self.mesh_dim_names)
         self._size = size
@@ -128,7 +130,7 @@ def test_autoparallel_config_validation():
     validate_autoparallel_config(compile_config)
 
 
-def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
+def test_autoparallel_regional_pass_selection_uses_auto_bucketing():
     from torchtitan.experiments.graph_trainer import passes
 
     traced_result = SimpleNamespace(
@@ -154,7 +156,135 @@ def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
     assert passes.tag_with_memory_policy_pass in pass_fns
     assert passes.selective_activation_remat_pass in pass_fns
     assert passes.apply_cpu_offload_pass in pass_fns
-    assert passes.joint_transformer_block_bucketing_reordering_pass in pass_fns
+    assert passes.autobucketing_reordering_pass in pass_fns
+    assert passes.joint_transformer_block_bucketing_reordering_pass not in pass_fns
+
+
+def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
+    from torchtitan.experiments.graph_trainer import passes
+
+    traced_result = SimpleNamespace(
+        gm=torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph()),
+        state_fqns=[],
+    )
+    config = SimpleNamespace(
+        compile=GraphTrainerCompileConfig(
+            enable_autoparallel=True,
+            enable_async_tensor_parallel=False,
+            disable_passes=["cudagraph_pass"],
+            inductor_compilation="full",
+        ),
+        model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
+        parallelism=SimpleNamespace(
+            fsdp_reshard_after_forward="always",
+            pipeline_parallel_degree=1,
+        ),
+    )
+
+    graph_passes = passes.construct_default_graph_passes(
+        traced_result, config, parallel_dims=_FakeParallelDims()
+    )
+    pass_fns = [getattr(pass_fn, "func", pass_fn) for pass_fn in graph_passes]
+
+    assert passes.autobucketing_reordering_pass not in pass_fns
+    assert passes.joint_transformer_block_bucketing_reordering_pass not in pass_fns
+    full_pass = next(
+        pass_fn
+        for pass_fn in graph_passes
+        if getattr(pass_fn, "func", pass_fn) is passes.full_inductor_compilation_pass
+    )
+    configs = full_pass.keywords["inductor_configs"]
+    assert configs["aten_distributed_optimizations.enable_overlap_scheduling"] is True
+    assert configs["aten_distributed_optimizations.collective_bucketing"] is True
+    assert configs["aten_distributed_optimizations.insert_overlap_deps"] is True
+    assert configs["aten_distributed_optimizations.max_compute_pre_fetch"] == 10
+    assert configs["reorder_for_peak_memory"] is False
+    assert configs["reorder_for_compute_comm_overlap"] is False
+    custom_pass = configs["post_grad_custom_post_pass"]
+    assert custom_pass.func.__name__ == "aten_autobucketing_reordering_pass"
+    assert custom_pass.keywords["configs"].custom_runtime_estimation is not None
+
+
+def test_autoparallel_sac_saves_forward_collectives_only():
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _save_autoparallel_collectives,
+    )
+
+    graph = torch.fx.Graph()
+    tensor = graph.placeholder("tensor")
+    all_gather = graph.call_function(
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
+        args=(tensor, 2, "group"),
+    )
+    wait = graph.call_function(
+        torch.ops._c10d_functional.wait_tensor.default,
+        args=(all_gather,),
+    )
+    all_to_all = graph.call_function(
+        torch.ops._dtensor.shard_dim_alltoall.default,
+        args=(wait, 0, 0, "group"),
+    )
+    backward_all_gather = graph.call_function(
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
+        args=(all_to_all, 2, "group"),
+    )
+    untagged_all_gather = graph.call_function(
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
+        args=(backward_all_gather, 2, "group"),
+    )
+    graph.output(untagged_all_gather)
+
+    for node in (all_gather, wait, all_to_all, backward_all_gather):
+        node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+    backward_all_gather.meta["autograd_backward"] = True
+
+    _save_autoparallel_collectives(SimpleNamespace(graph=graph))
+
+    assert all_gather.meta["recompute"] is CheckpointPolicy.MUST_SAVE
+    assert wait.meta["recompute"] is CheckpointPolicy.MUST_SAVE
+    assert all_to_all.meta["recompute"] is CheckpointPolicy.MUST_SAVE
+    assert backward_all_gather.meta["recompute"] is CheckpointPolicy.PREFER_RECOMPUTE
+    assert "recompute" not in untagged_all_gather.meta
+
+
+def test_autoparallel_graph_preserves_copied_model_fqns():
+    from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4, bias=False, device="meta")
+
+        def forward(self, x):
+            return self.linear(x).relu()
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Block()])
+
+        def forward(self, x):
+            return self.layers[0](x)
+
+    autop = AutoParallelGraph(
+        Model(),
+        lambda: (torch.randn(2, 4),),
+        _FakeMesh(("fsdp",), size=1),
+    )
+    with autop.fake_mode:
+        x = torch.empty(2, 4)
+        traced = minimal_fx_tracer(
+            lambda input_: autop.model(input_), module=autop.model
+        )(x)
+
+    fqns = {
+        custom["module_fqn"]
+        for node in traced.gm.graph.nodes
+        if (custom := node.meta.get("custom")) and "module_fqn" in custom
+    }
+    assert "layers.0" in fqns
+    assert "layers.0.linear" in fqns
 
 
 @pytest.mark.parametrize(
