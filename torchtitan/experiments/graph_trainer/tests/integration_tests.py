@@ -722,14 +722,11 @@ def _build_autoparallel_tests() -> list[OverrideDefinitions]:
 def _build_autoparallel_h100_tests() -> list[OverrideDefinitions]:
     """AutoParallel integration tests that require H100 runners."""
     return [
-        # TODO: Disabled due to upstream AutoParallel regression in PyTorch
-        # nightly dev20260508. AutoParallel rejects FakeTensor device
-        # mismatch (traced on meta vs actual cuda). Re-enable once fixed.
         OverrideDefinitions(
             [
                 [
                     "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
+                    "--config graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss",
                     "--compile.mode aot_fx_trace",
                     "--compile.enable_autoparallel",
                     "--parallelism.data_parallel_shard_degree 4",
@@ -739,7 +736,6 @@ def _build_autoparallel_h100_tests() -> list[OverrideDefinitions]:
             "autoparallel deepseek_v3 EFSDP+EP",
             "autoparallel_deepseek_v3_efsdp_ep",
             ngpu=4,
-            disabled=True,
         ),
     ]
 

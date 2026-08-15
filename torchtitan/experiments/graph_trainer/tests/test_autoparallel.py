@@ -57,6 +57,7 @@ class _FakeAutoParallelGraph:
 
     def __init__(self, model, input_fn, mesh, **kwargs):
         self.model = model
+        self.input_fn = input_fn
         self.kwargs = kwargs
         self.used_fx_path = False
         _FakeAutoParallelGraph.instances.append(self)
@@ -71,7 +72,7 @@ class _FakeAutoParallelGraph:
         pass
 
     def add_input_constraints(self, constraints):
-        pass
+        self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
         pass
@@ -250,15 +251,11 @@ def test_autoparallel_collective_save_hook_is_opt_in():
 
     assert autoparallel_policy == regular_policy
     assert (
-        autoparallel_policy[
-            torch.ops._c10d_functional.all_gather_into_tensor.default
-        ]
+        autoparallel_policy[torch.ops._c10d_functional.all_gather_into_tensor.default]
         is CheckpointPolicy.PREFER_RECOMPUTE
     )
     assert (
-        opted_in_policy[
-            torch.ops._c10d_functional.all_gather_into_tensor.default
-        ]
+        opted_in_policy[torch.ops._c10d_functional.all_gather_into_tensor.default]
         is CheckpointPolicy.MUST_SAVE
     )
     assert (
@@ -305,6 +302,96 @@ def test_autoparallel_graph_preserves_copied_model_fqns():
     }
     assert "layers.0" in fqns
     assert "layers.0.linear" in fqns
+
+
+def _normalize_deepseek_parameter_name(name):
+    return (
+        name.replace(
+            ".moe.routed_experts.inner_experts.w1_EFD",
+            ".moe.experts.w1",
+        )
+        .replace(
+            ".moe.routed_experts.inner_experts.w2_EDF",
+            ".moe.experts.w2",
+        )
+        .replace(
+            ".moe.routed_experts.inner_experts.w3_EFD",
+            ".moe.experts.w3",
+        )
+    )
+
+
+@pytest.mark.parametrize("flavor", ["debugmodel", "16B"])
+def test_autoparallel_deepseek_accepts_current_torchtitan_config(flavor):
+    pytest.importorskip("autoparallel")
+    from autoparallel._testing.models.dsv3 import DeepSeekV3Model
+
+    from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry
+
+    config = model_registry(flavor, attn_backend="sdpa").model
+    with torch.device("meta"):
+        native_model = config.build()
+        autoparallel_model = DeepSeekV3Model(
+            config,
+            mesh=None,
+            compute_dtype=torch.bfloat16,
+        )
+
+    native_parameters = {
+        _normalize_deepseek_parameter_name(name): (parameter.shape, parameter.dtype)
+        for name, parameter in native_model.named_parameters()
+    }
+    autoparallel_parameters = {
+        name: (parameter.shape, parameter.dtype)
+        for name, parameter in autoparallel_model.named_parameters()
+    }
+    assert autoparallel_parameters == native_parameters
+    assert sum(p.numel() for p in autoparallel_model.parameters()) == sum(
+        p.numel() for p in native_model.parameters()
+    )
+    if flavor == "16B":
+        assert sum(p.numel() for p in autoparallel_model.parameters()) == 15_706_484_224
+
+    moe = autoparallel_model.layers["1"].moe
+    assert moe.tokens_per_expert_E is moe.tokens_per_expert
+    assert moe.expert_bias_E is moe.expert_bias
+
+
+def test_autoparallel_deepseek_rope_uses_runtime_positions():
+    pytest.importorskip("autoparallel")
+    from autoparallel._testing.models.dsv3 import apply_rotary_emb, precompute_freqs_cis
+
+    from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry
+
+    config = model_registry("debugmodel", attn_backend="sdpa").model
+    rope_config = config.first_attention.rope
+    rope = rope_config.build()
+    batch_size = 8
+    seq_len = 2048
+    positions = torch.arange(seq_len).repeat(batch_size, 1)
+    positions[:, seq_len // 2 :] -= seq_len // 2
+    torch.manual_seed(42)
+    query = torch.randn(batch_size, seq_len, 1, rope_config.dim)
+
+    expected, _ = rope(query, query, positions)
+    freqs_cis = precompute_freqs_cis(config)
+    actual = apply_rotary_emb(query, freqs_cis[positions])
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_autoparallel_deepseek_rejects_flex_attention():
+    pytest.importorskip("autoparallel")
+    from autoparallel._testing.models.dsv3 import DeepSeekV3Model
+
+    from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry
+
+    config = model_registry("debugmodel", attn_backend="flex").model
+    with torch.device("meta"), pytest.raises(
+        ValueError,
+        match="does not support FlexAttention",
+    ):
+        DeepSeekV3Model(config, mesh=None, compute_dtype=torch.bfloat16)
 
 
 @pytest.mark.parametrize(
@@ -392,5 +479,6 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert mp_policy.reduce_dtype is torch.float32
     assert autop.kwargs["reshard_after_forward"] is expected_reshard_after_forward
     assert autop.kwargs.get("dynamic", False) is (model_name == "deepseek")
+    assert len(autop.input_constraints) == 2
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path
