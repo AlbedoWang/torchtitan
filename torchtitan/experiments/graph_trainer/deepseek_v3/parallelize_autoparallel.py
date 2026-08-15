@@ -21,6 +21,7 @@ layout via duck typing.
 import time
 
 import torch
+from autoparallel import ForwardInputs
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
@@ -171,7 +172,12 @@ def parallelize_autoparallel_deepseekv3(
             (global_batch_size, training.seq_len),
             device=torch.device(device_type),
         )
-        return tokens
+        positions = torch.arange(
+            training.seq_len,
+            dtype=torch.int64,
+            device=torch.device(device_type),
+        ).repeat(global_batch_size, 1)
+        return ForwardInputs(args=(tokens,), kwargs={"positions": positions})
 
     x_sharding = (Shard(0), Shard(0))
 
@@ -188,7 +194,7 @@ def parallelize_autoparallel_deepseekv3(
 
     with autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
-        autop.add_input_constraints([x_sharding])
+        autop.add_input_constraints([x_sharding, x_sharding])
         autop.add_output_constraints([x_sharding])
 
         t0 = time.time()

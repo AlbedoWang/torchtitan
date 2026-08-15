@@ -6,6 +6,7 @@
 
 from dataclasses import replace
 
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.quantization import (
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
@@ -16,6 +17,7 @@ from torchtitan.experiments.graph_trainer.configs import (
     to_graph_trainer_config,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.deepseek_v3 import model_registry as deepseek_v3_model_registry
 from torchtitan.models.deepseek_v3.config_registry import (
     deepseek_v3_16b,
@@ -31,6 +33,15 @@ from . import model_registry
 def graph_trainer_deepseek_v3_debugmodel() -> GraphTrainer.Config:
     config = to_graph_trainer_config(deepseek_v3_debugmodel(), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss() -> GraphTrainer.Config:
+    config = graph_trainer_deepseek_v3_debugmodel()
+    config.model_spec = model_registry("debugmodel", attn_backend="sdpa")
+    config.loss = CrossEntropyLoss.Config(
+        global_vocab_size=decoder_vocab_size(config.model_spec)
+    )
     return config
 
 
@@ -105,6 +116,14 @@ def graph_trainer_deepseek_v3_16b_minimal_async_ep() -> GraphTrainer.Config:
 def graph_trainer_deepseek_v3_16b_sdpa() -> GraphTrainer.Config:
     config = graph_trainer_deepseek_v3_16b()
     config.model_spec = model_registry("16B", attn_backend="sdpa")
+    return config
+
+
+def graph_trainer_deepseek_v3_16b_sdpa_cross_entropy_loss() -> GraphTrainer.Config:
+    config = graph_trainer_deepseek_v3_16b_sdpa()
+    config.loss = CrossEntropyLoss.Config(
+        global_vocab_size=decoder_vocab_size(config.model_spec)
+    )
     return config
 
 
