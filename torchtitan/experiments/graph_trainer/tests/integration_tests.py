@@ -705,7 +705,6 @@ def _build_autoparallel_tests() -> list[OverrideDefinitions]:
                 [
                     "--module graph_trainer.llama3",
                     "--config graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
-                    "--compile.mode aot_fx_trace",
                     "--compile.enable_autoparallel",
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
@@ -730,7 +729,6 @@ def _build_autoparallel_h100_tests() -> list[OverrideDefinitions]:
                 [
                     "--module graph_trainer.deepseek_v3",
                     "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode aot_fx_trace",
                     "--compile.enable_autoparallel",
                     "--parallelism.data_parallel_shard_degree 4",
                     "--parallelism.expert_parallel_degree 2",

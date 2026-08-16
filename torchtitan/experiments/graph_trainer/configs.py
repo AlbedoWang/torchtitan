@@ -169,6 +169,29 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Use AutoParallelGraph (ILP solver-based SPMD sharding) instead of
     manual TP/FSDP/EP. Forces the AOT compilation path internally."""
 
+    use_autoparallel_defaults: bool = True
+    """Use the validated GraphTrainer compiler defaults with AutoParallel.
+
+    Disable this only when explicitly configuring an alternative AutoParallel
+    compiler or pass setup.
+    """
+
+    def __post_init__(self) -> None:
+        CompileConfig.__post_init__(self)
+        validate_autoparallel_config(self)
+        if not (self.enable_autoparallel and self.use_autoparallel_defaults):
+            return
+
+        self.backend = "aot_eager"
+        self.memory_policy = "eager"
+        self.pass_pipeline = "default"
+        self.inductor_compilation = "full"
+        self.numerics_changing_optim = False
+        self.enable_fsdp_ag_rs_overlap = False
+        self.enable_fsdp_dense_region_overlap = False
+        if "cudagraph_pass" not in self.disable_passes:
+            self.disable_passes = [*self.disable_passes, "cudagraph_pass"]
+
 
 def validate_autoparallel_config(
     compile_config: GraphTrainerCompileConfig,

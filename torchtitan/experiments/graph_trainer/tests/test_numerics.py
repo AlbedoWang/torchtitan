@@ -509,11 +509,7 @@ def _run_autoparallel_llama3_loss_compare() -> bool:
         test_module="graph_trainer.llama3",
         test_config="graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
         baseline_options=AUTOPARALLEL_LLAMA3_PARALLELISM,
-        test_options=(
-            f"{AUTOPARALLEL_LLAMA3_PARALLELISM}"
-            " --compile.mode aot_fx_trace"
-            " --compile.enable_autoparallel"
-        ),
+        test_options=f"{AUTOPARALLEL_LLAMA3_PARALLELISM} --compile.enable_autoparallel",
         baseline_ngpus=4,
         test_ngpus=4,
     )
@@ -533,11 +529,7 @@ def _run_autoparallel_deepseek_v3_loss_compare() -> bool:
         test_module="graph_trainer.deepseek_v3",
         test_config="graph_trainer_deepseek_v3_debugmodel",
         baseline_options=AUTOPARALLEL_DSV3_PARALLELISM,
-        test_options=(
-            f"{AUTOPARALLEL_DSV3_PARALLELISM}"
-            " --compile.mode aot_fx_trace"
-            " --compile.enable_autoparallel"
-        ),
+        test_options=f"{AUTOPARALLEL_DSV3_PARALLELISM} --compile.enable_autoparallel",
         baseline_ngpus=4,
         test_ngpus=4,
         rtol=5e-4,

@@ -6,6 +6,7 @@
 
 from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -114,20 +115,106 @@ def test_autoparallel_integration_matrix():
     assert all(test.ngpu == 4 for tests in suites.values() for test in tests)
 
 
-def test_autoparallel_config_validation():
+def _assert_validated_autoparallel_defaults(
+    compile_config: GraphTrainerCompileConfig,
+) -> None:
+    assert {
+        "enable_autoparallel": compile_config.enable_autoparallel,
+        "use_autoparallel_defaults": compile_config.use_autoparallel_defaults,
+        "mode": compile_config.mode,
+        "backend": compile_config.backend,
+        "memory_policy": compile_config.memory_policy,
+        "pass_pipeline": compile_config.pass_pipeline,
+        "inductor_compilation": compile_config.inductor_compilation,
+        "numerics_changing_optim": compile_config.numerics_changing_optim,
+        "enable_fsdp_ag_rs_overlap": compile_config.enable_fsdp_ag_rs_overlap,
+        "enable_fsdp_dense_region_overlap": (
+            compile_config.enable_fsdp_dense_region_overlap
+        ),
+        "disable_passes": compile_config.disable_passes,
+    } == {
+        "enable_autoparallel": True,
+        "use_autoparallel_defaults": True,
+        "mode": "aot_fx_trace",
+        "backend": "aot_eager",
+        "memory_policy": "eager",
+        "pass_pipeline": "default",
+        "inductor_compilation": "full",
+        "numerics_changing_optim": False,
+        "enable_fsdp_ag_rs_overlap": False,
+        "enable_fsdp_dense_region_overlap": False,
+        "disable_passes": ["cudagraph_pass"],
+    }
+
+
+def test_autoparallel_config_validation_and_defaults():
     with pytest.raises(ValueError, match="only supports --compile.mode aot_fx_trace"):
-        validate_autoparallel_config(
-            GraphTrainerCompileConfig(
-                mode="jit",
-                enable_autoparallel=True,
-            )
+        GraphTrainerCompileConfig(
+            mode="jit",
+            enable_autoparallel=True,
         )
 
-    compile_config = GraphTrainerCompileConfig(
-        inductor_compilation="regional",
+    regular_compile_config = GraphTrainerCompileConfig()
+    assert regular_compile_config.memory_policy == "default"
+    assert regular_compile_config.inductor_compilation == "regional"
+    assert regular_compile_config.disable_passes == []
+
+    compile_config = GraphTrainerCompileConfig(enable_autoparallel=True)
+    _assert_validated_autoparallel_defaults(compile_config)
+
+    already_disabled = GraphTrainerCompileConfig(
         enable_autoparallel=True,
+        disable_passes=["cudagraph_pass"],
     )
-    validate_autoparallel_config(compile_config)
+    assert already_disabled.disable_passes == ["cudagraph_pass"]
+
+    custom_compile_config = GraphTrainerCompileConfig(
+        backend="custom",
+        memory_policy="default",
+        pass_pipeline="custom",
+        inductor_compilation="regional",
+        numerics_changing_optim=True,
+        enable_fsdp_ag_rs_overlap=True,
+        enable_fsdp_dense_region_overlap=True,
+        enable_autoparallel=True,
+        use_autoparallel_defaults=False,
+    )
+    validate_autoparallel_config(custom_compile_config)
+    assert custom_compile_config.backend == "custom"
+    assert custom_compile_config.memory_policy == "default"
+    assert custom_compile_config.pass_pipeline == "custom"
+    assert custom_compile_config.inductor_compilation == "regional"
+    assert custom_compile_config.numerics_changing_optim
+    assert custom_compile_config.enable_fsdp_ag_rs_overlap
+    assert custom_compile_config.enable_fsdp_dense_region_overlap
+    assert custom_compile_config.disable_passes == []
+
+
+@pytest.mark.parametrize(
+    ("module", "recipe"),
+    [
+        ("graph_trainer.llama3", "graph_trainer_llama3_8b"),
+        ("graph_trainer.deepseek_v3", "graph_trainer_deepseek_v3_debugmodel"),
+    ],
+)
+def test_autoparallel_cli_uses_validated_defaults(module, recipe):
+    from torchtitan.config import ConfigManager
+    from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+
+    config = cast(
+        GraphTrainer.Config,
+        ConfigManager().parse_args(
+            [
+                "--module",
+                module,
+                "--config",
+                recipe,
+                "--compile.enable_autoparallel",
+            ]
+        ),
+    )
+
+    _assert_validated_autoparallel_defaults(config.compile)
 
 
 def test_autoparallel_regional_pass_selection_uses_auto_bucketing():
@@ -140,6 +227,7 @@ def test_autoparallel_regional_pass_selection_uses_auto_bucketing():
     config = SimpleNamespace(
         compile=GraphTrainerCompileConfig(
             enable_autoparallel=True,
+            use_autoparallel_defaults=False,
             enable_async_tensor_parallel=False,
             disable_passes=["cudagraph_pass"],
         ),
@@ -171,8 +259,6 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
         compile=GraphTrainerCompileConfig(
             enable_autoparallel=True,
             enable_async_tensor_parallel=False,
-            disable_passes=["cudagraph_pass"],
-            inductor_compilation="full",
         ),
         model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
         parallelism=SimpleNamespace(
@@ -186,6 +272,15 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
     )
     pass_fns = [getattr(pass_fn, "func", pass_fn) for pass_fn in graph_passes]
 
+    assert pass_fns == [
+        passes.eliminate_dead_code_pass,
+        passes.canonicalize_graph_pass,
+        passes.deduplicate_fsdp_unshard_chains_pass,
+        passes.tag_with_memory_policy_pass,
+        passes.apply_cpu_offload_pass,
+        passes.selective_activation_remat_pass,
+        passes.full_inductor_compilation_pass,
+    ]
     assert passes.autobucketing_reordering_pass not in pass_fns
     assert passes.joint_transformer_block_bucketing_reordering_pass not in pass_fns
     full_pass = next(
@@ -242,9 +337,7 @@ def test_autoparallel_uses_eager_sac_collective_policy():
 
     assert autoparallel_policy == regular_policy
     assert (
-        autoparallel_policy[
-            torch.ops._c10d_functional.all_gather_into_tensor.default
-        ]
+        autoparallel_policy[torch.ops._c10d_functional.all_gather_into_tensor.default]
         is CheckpointPolicy.PREFER_RECOMPUTE
     )
 
@@ -316,6 +409,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     compile_config = GraphTrainerCompileConfig(
         enable_autoparallel=True,
         inductor_compilation=inductor_compilation,
+        use_autoparallel_defaults=False,
     )
     parallelism = ParallelismConfig(
         fsdp_reshard_after_forward=fsdp_reshard_after_forward

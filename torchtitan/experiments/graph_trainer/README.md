@@ -177,14 +177,14 @@ Current limitations:
 
 GraphTrainer can use AutoParallel to solve SPMD placement for supported models,
 then trace and compile the placed model through the regular `aot_fx_trace`
-flow. Enable it with `--compile.enable_autoparallel`; `--compile.mode
-aot_fx_trace` is required.
+flow. Enable it with `--compile.enable_autoparallel`. By default this selects
+the validated AutoParallel compiler setup: `aot_eager`, eager-equivalent SAC,
+the default pass pipeline, full Inductor compilation, and no CUDA graph pass.
 
 Llama 3 debug model:
 
 ```bash
 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_debugmodel ./run_train.sh \
-  --compile.mode aot_fx_trace \
   --compile.enable_autoparallel \
   --parallelism.data_parallel_shard_degree 2 \
   --parallelism.tensor_parallel_degree 2
@@ -194,7 +194,6 @@ DeepSeek V3 debug model:
 
 ```bash
 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./run_train.sh \
-  --compile.mode aot_fx_trace \
   --compile.enable_autoparallel \
   --parallelism.data_parallel_shard_degree 4 \
   --parallelism.expert_parallel_degree 2
@@ -207,6 +206,9 @@ activation remat, CPU offload, bucketing and overlap passes, regional or full
 Inductor compilation, CUDA graph compatibility checks, and any other enabled
 GraphTrainer passes. This keeps AutoParallel placement composable with the same
 compiler options used by manually parallelized GraphTrainer models.
+
+Set `--compile.no_use_autoparallel_defaults` to opt out before explicitly
+selecting a different AutoParallel compiler or pass setup.
 
 AutoParallel can choose different sharding, collective schedules, and operator
 lowerings from the manual parallelization path. This can change numerics, so
