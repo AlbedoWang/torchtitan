@@ -63,6 +63,7 @@ class _FakeAutoParallelGraph:
         _FakeAutoParallelGraph.instances.append(self)
 
     def __enter__(self):
+        self.traced_inputs = self.input_fn()
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -457,8 +458,14 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
         call_parallelize = parallelize_autoparallel.parallelize_autoparallel_qwen3
         extra_patches = (
             patch.object(
-                parallelize_autoparallel, "annotate_qwen3", lambda model: None
+                parallelize_autoparallel, "annotate_moe_ep_regions", lambda: None
             ),
+            patch.object(
+                parallelize_autoparallel,
+                "_create_trace_attention_masks",
+                lambda model, positions: positions,
+            ),
+            patch.object(parallelize_autoparallel, "device_type", "cpu"),
         )
 
     with ExitStack() as stack:
@@ -491,6 +498,6 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert mp_policy.reduce_dtype is torch.float32
     assert autop.kwargs["reshard_after_forward"] is expected_reshard_after_forward
     assert autop.kwargs.get("dynamic", False) is (model_name != "llama")
-    assert len(autop.input_constraints) == 2
+    assert len(autop.input_constraints) == (3 if model_name == "qwen" else 2)
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path
