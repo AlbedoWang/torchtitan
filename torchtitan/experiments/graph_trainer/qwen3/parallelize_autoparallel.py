@@ -12,51 +12,20 @@ import torch
 from autoparallel import ForwardInputs
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
-from torch.nn.attention.flex_attention import and_masks, create_block_mask
 
 from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
-from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
-from torchtitan.experiments.graph_trainer.common_utils import (
-    annotate_moe_ep_regions,
-    maybe_register_blockmask_pytree_node,
-)
+from torchtitan.experiments.graph_trainer.common_utils import annotate_moe_ep_regions
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     validate_autoparallel_config,
 )
-from torchtitan.models.common.attention import (
-    FlexAttention,
-    get_causal_mask_mod,
-    get_efficient_causal_mask_mod_for_packed_document,
-)
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_type
-
-
-def _create_trace_attention_masks(model, positions):
-    attention_config = model.config.first_attention
-    inner_attention = attention_config.inner_attention
-    if not isinstance(inner_attention, FlexAttention.Config):
-        raise ValueError("AutoParallel Qwen3 requires FlexAttention")
-    batch_size, seq_len = positions.shape
-    return create_block_mask(
-        and_masks(
-            get_causal_mask_mod(),
-            get_efficient_causal_mask_mod_for_packed_document(positions),
-        ),
-        B=batch_size,
-        H=None,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
-        device=positions.device,
-        BLOCK_SIZE=inner_attention.block_size,
-        separate_full_blocks=not is_in_batch_invariant_mode(),
-    )
 
 
 def parallelize_autoparallel_qwen3(
@@ -102,16 +71,13 @@ def parallelize_autoparallel_qwen3(
         )
 
     annotate_moe_ep_regions()
-    maybe_register_blockmask_pytree_node()
     x_sharding = (Shard(0), Shard(0))
-    input_constraints = None
     global_batch_size = training.global_batch_size
     if global_batch_size < 0:
         dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
         global_batch_size = training.local_batch_size * dp_degree
 
     def input_fn():
-        nonlocal input_constraints
         tokens = torch.randint(
             0,
             model.config.vocab_size,
@@ -123,15 +89,9 @@ def parallelize_autoparallel_qwen3(
             dtype=torch.int64,
             device=torch.device(device_type),
         ).repeat(global_batch_size, 1)
-        attention_masks = _create_trace_attention_masks(model, positions)
-        mask_tensors = torch.utils._pytree.tree_leaves(attention_masks)
-        input_constraints = [x_sharding] * (2 + len(mask_tensors))
         return ForwardInputs(
             args=(tokens,),
-            kwargs={
-                "positions": positions,
-                "attention_masks": attention_masks,
-            },
+            kwargs={"positions": positions},
         )
 
     mp_policy = MixedPrecisionPolicy(
@@ -151,10 +111,8 @@ def parallelize_autoparallel_qwen3(
         reshard_after_forward=reshard_after_forward,
         dynamic=True,
     ) as autop:
-        if input_constraints is None:
-            raise RuntimeError("AutoParallel Qwen3 input tracing did not run")
         autop.add_parameter_memory_constraint(low=None, high=None)
-        autop.add_input_constraints(input_constraints)
+        autop.add_input_constraints([x_sharding, x_sharding])
         autop.add_output_constraints([x_sharding])
 
         start = time.time()

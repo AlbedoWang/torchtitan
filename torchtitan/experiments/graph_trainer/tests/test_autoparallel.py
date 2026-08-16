@@ -460,11 +460,6 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
             patch.object(
                 parallelize_autoparallel, "annotate_moe_ep_regions", lambda: None
             ),
-            patch.object(
-                parallelize_autoparallel,
-                "_create_trace_attention_masks",
-                lambda model, positions: positions,
-            ),
             patch.object(parallelize_autoparallel, "device_type", "cpu"),
         )
 
@@ -498,6 +493,6 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert mp_policy.reduce_dtype is torch.float32
     assert autop.kwargs["reshard_after_forward"] is expected_reshard_after_forward
     assert autop.kwargs.get("dynamic", False) is (model_name != "llama")
-    assert len(autop.input_constraints) == (3 if model_name == "qwen" else 2)
+    assert len(autop.input_constraints) == 2
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path
