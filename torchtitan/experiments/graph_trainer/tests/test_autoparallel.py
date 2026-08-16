@@ -404,6 +404,7 @@ def test_autoparallel_deepseek_rejects_flex_attention():
     [
         ("llama", "regional", "always", True),
         ("deepseek", "full", "never", False),
+        ("qwen", "regional", "always", True),
     ],
 )
 def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
@@ -433,7 +434,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
         parallel_dims = _FakeParallelDims()
         call_parallelize = parallelize_autoparallel.parallelize_autoparallel_llama
         extra_patches = ()
-    else:
+    elif model_name == "deepseek":
         from torchtitan.experiments.graph_trainer.deepseek_v3 import (
             parallelize_autoparallel,
         )
@@ -446,6 +447,17 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
                 parallelize_autoparallel,
                 "_load_autoparallel_dsv3_dependency",
                 return_value=(FakeDeepSeekV3Model, lambda model: None),
+            ),
+        )
+    else:
+        from torchtitan.experiments.graph_trainer.qwen3 import parallelize_autoparallel
+
+        model = SimpleNamespace(config=SimpleNamespace(vocab_size=16))
+        parallel_dims = _FakeParallelDims(sparse=True)
+        call_parallelize = parallelize_autoparallel.parallelize_autoparallel_qwen3
+        extra_patches = (
+            patch.object(
+                parallelize_autoparallel, "annotate_qwen3", lambda model: None
             ),
         )
 
@@ -478,7 +490,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert mp_policy.param_dtype is torch.bfloat16
     assert mp_policy.reduce_dtype is torch.float32
     assert autop.kwargs["reshard_after_forward"] is expected_reshard_after_forward
-    assert autop.kwargs.get("dynamic", False) is (model_name == "deepseek")
+    assert autop.kwargs.get("dynamic", False) is (model_name != "llama")
     assert len(autop.input_constraints) == 2
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path

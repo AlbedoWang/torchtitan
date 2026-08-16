@@ -16,6 +16,16 @@ from .model import GraphTrainerQwen3Model
 from .parallelize import parallelize_qwen3
 
 
+def _parallelize_fn(model, *, compile_config, **kwargs):
+    if compile_config.enable_autoparallel:
+        from .parallelize_autoparallel import parallelize_autoparallel_qwen3
+
+        return parallelize_autoparallel_qwen3(
+            model, compile_config=compile_config, **kwargs
+        )
+    return parallelize_qwen3(model, compile_config=compile_config, **kwargs)
+
+
 def model_registry(
     flavor: str,
     attn_backend: str = "flex",
@@ -34,7 +44,7 @@ def model_registry(
         name="graph_trainer/qwen3",
         flavor=flavor,
         model=config,
-        parallelize_fn=parallelize_qwen3,
+        parallelize_fn=_parallelize_fn,
         pipelining_fn=graph_pipeline_llm,
         post_optimizer_build_fn=None,
         state_dict_adapter=Qwen3StateDictAdapter,
