@@ -517,6 +517,16 @@ class MuseGlimmerModel(Decoder):
         self,
         positions: torch.Tensor,
     ) -> AttentionMasksType:
+        return self._get_attention_masks_with_factory(
+            positions,
+            create_attention_mask,
+        )
+
+    def _get_attention_masks_with_factory(
+        self,
+        positions: torch.Tensor,
+        create_mask,
+    ) -> AttentionMasksType:
         attn_config = self.config.first_attention
         assert attn_config is not None
         inner_attn = attn_config.inner_attention
@@ -547,7 +557,7 @@ class MuseGlimmerModel(Decoder):
         separate_full_blocks = not is_in_batch_invariant_mode()
 
         def _build_mask(mask_mods: list) -> BlockMask:
-            return create_attention_mask(
+            return create_mask(
                 and_masks(*mask_mods),
                 B,
                 None,

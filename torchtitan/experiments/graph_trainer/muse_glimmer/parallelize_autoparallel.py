@@ -10,6 +10,7 @@ import torch
 from autoparallel import ForwardInputs
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.nn.attention.flex_attention import create_block_mask
 
 from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -19,15 +20,60 @@ from torchtitan.experiments.graph_trainer.autoparallel_api import (
     AutoParallelGraph,
     AutoParallelModelOutput,
 )
+from torchtitan.experiments.graph_trainer.common_utils import (
+    maybe_register_blockmask_pytree_node,
+)
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     validate_autoparallel_config,
 )
+from torchtitan.models.common.attention import FlexAttention
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_type
 
-from .sdpa import build_packed_document_attention_masks
+from .sdpa import (
+    build_packed_document_attention_masks,
+    MuseGlimmerPackedDocumentSDPA,
+)
+
+
+def _attention_masks(model, positions, window_sizes):
+    inner_attention = model.config.first_attention.inner_attention
+    if isinstance(inner_attention, FlexAttention.Config):
+        maybe_register_blockmask_pytree_node()
+        return model._get_attention_masks_with_factory(positions, create_block_mask)
+    if isinstance(inner_attention, MuseGlimmerPackedDocumentSDPA.Config):
+        return build_packed_document_attention_masks(positions, window_sizes)
+    raise TypeError(
+        "AutoParallel Muse Glimmer supports FlexAttention and packed-document "
+        f"SDPA, got {type(inner_attention).__name__}"
+    )
+
+
+def _input_constraints(traced_inputs, dense_mesh, global_batch_size):
+    flat_inputs, _ = torch.utils._pytree.tree_flatten(
+        (tuple(traced_inputs.args), traced_inputs.kwargs)
+    )
+    constraints = []
+    for value in flat_inputs:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                "AutoParallel Muse Glimmer requires tensor-only forward input "
+                f"leaves, got {type(value).__name__}"
+            )
+        batch_sharded = value.ndim > 0 and value.shape[0] == global_batch_size
+        constraints.append(
+            tuple(
+                (
+                    Shard(0)
+                    if batch_sharded and axis in ("dp_replicate", "fsdp")
+                    else Replicate()
+                )
+                for axis in dense_mesh.mesh_dim_names
+            )
+        )
+    return constraints
 
 
 def parallelize_autoparallel_muse_glimmer(
@@ -63,11 +109,12 @@ def parallelize_autoparallel_muse_glimmer(
         if layer.attention.window_size is not None
     }
 
+    global_batch_size = training.global_batch_size
+    if global_batch_size < 0:
+        dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
+        global_batch_size = training.local_batch_size * dp_degree
+
     def input_fn():
-        global_batch_size = training.global_batch_size
-        if global_batch_size < 0:
-            dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = training.local_batch_size * dp_degree
         tokens = torch.randint(
             0,
             model.config.vocab_size,
@@ -79,10 +126,7 @@ def parallelize_autoparallel_muse_glimmer(
             dtype=torch.int64,
             device=torch.device(device_type),
         ).repeat(global_batch_size, 1)
-        attention_masks = build_packed_document_attention_masks(
-            positions,
-            window_sizes,
-        )
+        attention_masks = _attention_masks(model, positions, window_sizes)
         return ForwardInputs(
             args=(tokens,),
             kwargs={
@@ -101,25 +145,16 @@ def parallelize_autoparallel_muse_glimmer(
         parallel_dims.pp_enabled,
     )
 
-    possible_input_shardings = {
-        "dp_replicate": Shard(0),
-        "fsdp": Shard(0),
-        "tp": Replicate(),
-    }
+    supported_axes = ("dp_replicate", "fsdp", "tp")
     unsupported_axes = [
-        name
-        for name in dense_mesh.mesh_dim_names
-        if name not in possible_input_shardings
+        name for name in dense_mesh.mesh_dim_names if name not in supported_axes
     ]
     if unsupported_axes:
         raise ValueError(
             "Unsupported mesh axis for AutoParallel Muse Glimmer: "
             f"{unsupported_axes}. Supported axes: "
-            f"{tuple(possible_input_shardings.keys())}"
+            f"{tuple(supported_axes)}"
         )
-    input_sharding = tuple(
-        possible_input_shardings[name] for name in dense_mesh.mesh_dim_names
-    )
     output_sharding = tuple(
         Shard(2) if name == "tp" else Shard(0) for name in dense_mesh.mesh_dim_names
     )
@@ -134,7 +169,9 @@ def parallelize_autoparallel_muse_glimmer(
         solver="approx",
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
-        autop.add_input_constraints([input_sharding] * (2 + 1 + len(window_sizes)))
+        autop.add_input_constraints(
+            _input_constraints(autop._traced_inputs, dense_mesh, global_batch_size)
+        )
         autop.add_output_constraints([output_sharding])
 
         start = time.perf_counter()

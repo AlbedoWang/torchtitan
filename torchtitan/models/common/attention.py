@@ -472,67 +472,38 @@ def get_efficient_causal_mask_mod_for_packed_document(
     causal packed-document masking, which is why it coexists with the generic
     document-id mask.
 
-    For ``batch_size == 1``, the causal mask supplies the upper bound,
-    ``kv_idx <= q_idx``, and this mask supplies the lower bound,
-    ``doc_start[q_idx] <= kv_idx``. For ``batch_size > 1``, the causal mask
-    supplies the lower bound, ``kv_idx <= q_idx``, and this mask supplies the
-    upper bound, ``q_idx <= doc_end[kv_idx]``. A query in the next document
-    cannot attend to a key in the previous document because that key's
-    ``doc_end`` is before the query.
+    The causal mask supplies the upper bound, ``kv_idx <= q_idx``, and this mask
+    supplies the lower bound, ``doc_start[q_idx] <= kv_idx``. The batched
+    document-offset representation keeps the mask closure layout independent of
+    batch size, which is required when a global-batch graph runs on local batches.
 
     The result is same-document causal masking. This mask is not intended for
     non-causal use.
     """
     batch_size, seq_len = positions.shape
-    if batch_size == 1:
-        document_starts = positions[0] == 0
-        document_id = torch.cumsum(document_starts.int(), dim=0).to(torch.int32) - 1
-        token_idx = torch.arange(seq_len, device=positions.device, dtype=torch.int32)
-        offsets = torch.full(
-            (round_up(seq_len + 1, 128),),
-            seq_len,
-            device=positions.device,
-            dtype=torch.int32,
-        )
-        offsets.scatter_(
-            0,
-            torch.where(
-                document_starts, document_id, torch.full_like(document_id, seq_len)
-            ).to(torch.int64),
-            torch.where(
-                document_starts, token_idx, torch.full_like(token_idx, seq_len)
-            ),
-        )
-
-        def packed_document_mask(
-            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-        ) -> torch.Tensor:
-            return kv_idx >= offsets[document_id[q_idx]]
-
-        return packed_document_mask
-
     document_starts = positions == 0
     document_id = torch.cumsum(document_starts.int(), dim=1).to(torch.int32) - 1
     token_idx = torch.arange(
         seq_len, device=positions.device, dtype=torch.int32
     ).expand_as(positions)
-    next_doc_start = torch.full(
-        (batch_size, seq_len), seq_len, device=positions.device, dtype=torch.int32
+    offsets = torch.full(
+        (batch_size, round_up(seq_len + 1, 128)),
+        seq_len,
+        device=positions.device,
+        dtype=torch.int32,
     )
-    next_doc = document_starts & (document_id > 0)
-    next_doc_start.scatter_(
+    offsets.scatter_(
         1,
         torch.where(
-            next_doc, document_id - 1, torch.full_like(document_id, seq_len - 1)
+            document_starts, document_id, torch.full_like(document_id, seq_len)
         ).to(torch.int64),
-        torch.where(next_doc, token_idx, torch.full_like(token_idx, seq_len)),
+        torch.where(document_starts, token_idx, torch.full_like(token_idx, seq_len)),
     )
-    doc_end_by_token = next_doc_start.gather(1, document_id.to(torch.int64)) - 1
 
     def packed_document_mask(
         b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
     ) -> torch.Tensor:
-        return q_idx <= doc_end_by_token[b, kv_idx]
+        return kv_idx >= offsets[b, document_id[b, q_idx]]
 
     return packed_document_mask
 
@@ -583,7 +554,11 @@ def get_sliding_window_mask_mod(window_size: int) -> _mask_mod_signature:
         )
 
     def sliding_window_mod(
-        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        window_size: int = window_size,
     ) -> torch.Tensor:
         # Window mask: can only attend within the window
         # q_idx - kv_idx < window_size ensures we look at most window_size-1 tokens back

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import fields, replace
+from typing import Literal
 
 from datasets import Features, Value, load_dataset
 from huggingface_hub import hf_hub_download
@@ -84,11 +85,14 @@ def _copy_config(config, config_type):
     return config_type(**{f.name: getattr(config, f.name) for f in fields(config)})
 
 
-def _muse_glimmer_30b_sdpa_c4_base():
+def _muse_glimmer_30b_c4_base(
+    attention_backend: Literal["flex", "sdpa"],
+):
     config = muse_glimmer_30b()
-    config.model_spec = set_model_spec_packed_document_sdpa(
-        muse_glimmer_model_registry("30B", attn_backend="flex")
-    )
+    if attention_backend == "sdpa":
+        config.model_spec = set_model_spec_packed_document_sdpa(
+            muse_glimmer_model_registry("30B", attn_backend="flex")
+        )
     config.loss = CrossEntropyLoss.Config(
         global_vocab_size=decoder_vocab_size(config.model_spec),
     )
@@ -123,6 +127,14 @@ def _muse_glimmer_30b_sdpa_c4_base():
     )
     config.debug = replace(config.debug, seed=42)
     return config
+
+
+def _muse_glimmer_30b_sdpa_c4_base():
+    return _muse_glimmer_30b_c4_base("sdpa")
+
+
+def _muse_glimmer_30b_flex_c4_base():
+    return _muse_glimmer_30b_c4_base("flex")
 
 
 def graph_trainer_muse_glimmer_debugmodel() -> GraphTrainer.Config:
@@ -162,3 +174,27 @@ def graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2() -> (
         enable_autoparallel=True,
     )
     return _copy_config(config, GraphTrainerMuseGlimmerPackedSDPATrainer.Config)
+
+
+def graph_trainer_muse_glimmer_30b_flex_c4_4x2() -> GraphTrainer.Config:
+    base = _muse_glimmer_30b_flex_c4_base()
+    config = to_graph_trainer_config(base, model_registry)
+    validated_ap_compile = GraphTrainerCompileConfig(
+        enable=True,
+        enable_autoparallel=True,
+    )
+    config.compile = replace(
+        validated_ap_compile,
+        enable_autoparallel=False,
+    )
+    return config
+
+
+def graph_trainer_muse_glimmer_30b_flex_c4_autoparallel_4x2() -> GraphTrainer.Config:
+    base = _muse_glimmer_30b_flex_c4_base()
+    config = to_graph_trainer_config(base, model_registry)
+    config.compile = GraphTrainerCompileConfig(
+        enable=True,
+        enable_autoparallel=True,
+    )
+    return config
