@@ -94,6 +94,7 @@ def test_flex_masks_and_2d_input_constraints_preserve_batch_sharding():
         )
         assert flat_masks
         assert all(isinstance(value, torch.Tensor) for value in flat_masks)
+        assert len(flat_masks) == len(masks) * 8
         assert mask_spec == reference_mask_spec
         assert len(flat_masks) == len(flat_reference_masks)
         if expected_mask_spec is None:

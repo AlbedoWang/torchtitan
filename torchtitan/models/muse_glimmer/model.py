@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import and_masks, BlockMask
+from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import (
@@ -17,9 +17,6 @@ from torchtitan.models.common.attention import (
     create_attention_mask,
     create_varlen_metadata_for_document,
     FlexAttention,
-    get_causal_mask_mod,
-    get_efficient_causal_mask_mod_for_packed_document,
-    get_sliding_window_mask_mod,
     GQAttention,
     VarlenAttention,
 )
@@ -29,6 +26,7 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.protocols.module import Module
+from torchtitan.tools.utils import round_up
 
 from .vision_encoder import MuseGlimmerVisionAdapter, MuseGlimmerVisionEncoder
 
@@ -36,6 +34,50 @@ from .vision_encoder import MuseGlimmerVisionAdapter, MuseGlimmerVisionEncoder
 def _window_mask_key(window_size: int | None) -> str:
     """Mask-dict key for a layer's attention window (``"global"`` or ``"swa_<n>"``)."""
     return "global" if window_size is None else f"swa_{window_size}"
+
+
+class _PackedDocumentCausalMask:
+    """Packed-document causal mask with a stable pytree representation.
+
+    ``BlockMask`` extracts tensor closure contents while flattening outside
+    Dynamo, but Dynamo lifts those same contents from the callable itself. A
+    closure-based mask therefore has a different input pytree inside and
+    outside tracing. Keeping the tensors on a callable object avoids closure
+    extraction while still letting Dynamo lift them as FlexAttention mask
+    buffers.
+    """
+
+    def __init__(
+        self,
+        document_id: torch.Tensor,
+        offsets: torch.Tensor,
+        window_size: int | None,
+    ) -> None:
+        self.document_id = document_id
+        self.offsets = offsets
+        self.window_size = window_size
+
+    def __call__(
+        self,
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = (kv_idx <= q_idx) & (
+            kv_idx >= self.offsets[b, self.document_id[b, q_idx]]
+        )
+        if self.window_size is not None:
+            mask = mask & (q_idx - kv_idx < self.window_size)
+        return mask
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _PackedDocumentCausalMask) and (
+            self.window_size == other.window_size
+        )
+
+    def __hash__(self) -> int:
+        return hash((_PackedDocumentCausalMask, self.window_size))
 
 
 class RMSGainCenterNorm(RMSNorm):
@@ -546,19 +588,41 @@ class MuseGlimmerModel(Decoder):
         # mask ANDed with the causal mask yields same-document causal attention.
         seq_len = positions.shape[1]
         B = positions.shape[0]
-        base_mods = [
-            get_causal_mask_mod(),
-            get_efficient_causal_mask_mod_for_packed_document(positions),
-        ]
+        document_starts = positions == 0
+        document_id = (
+            torch.cumsum(document_starts.int(), dim=1).to(torch.int32) - 1
+        )
+        token_idx = torch.arange(
+            seq_len, device=positions.device, dtype=torch.int32
+        ).expand_as(positions)
+        offsets = torch.full(
+            (B, round_up(seq_len + 1, 128)),
+            seq_len,
+            device=positions.device,
+            dtype=torch.int32,
+        )
+        offsets.scatter_(
+            1,
+            torch.where(
+                document_starts,
+                document_id,
+                torch.full_like(document_id, seq_len),
+            ).to(torch.int64),
+            torch.where(
+                document_starts,
+                token_idx,
+                torch.full_like(token_idx, seq_len),
+            ),
+        )
 
         # Match the base Decoder mask-building so the configured block size and
         # batch-invariance handling are honored.
         block_size = inner_attn.block_size
         separate_full_blocks = not is_in_batch_invariant_mode()
 
-        def _build_mask(mask_mods: list) -> BlockMask:
+        def _build_mask(window_size: int | None) -> BlockMask:
             return create_mask(
-                and_masks(*mask_mods),
+                _PackedDocumentCausalMask(document_id, offsets, window_size),
                 B,
                 None,
                 seq_len,
@@ -570,17 +634,15 @@ class MuseGlimmerModel(Decoder):
 
         # "global" mask (no sliding window) plus one mask per distinct sliding
         # window size across the layers; Attention.forward selects by window.
-        # All masks are built from the same ``base_mods`` so the global and
+        # All masks share the same packed-document tensors so the global and
         # windowed variants cannot drift apart.
-        masks: dict[str, BlockMask] = {_window_mask_key(None): _build_mask(base_mods)}
+        masks: dict[str, BlockMask] = {_window_mask_key(None): _build_mask(None)}
         window_sizes = {
             layer.attention.window_size
             for layer in self.config.layers
             if layer.attention.window_size is not None
         }
         for window_size in window_sizes:
-            masks[_window_mask_key(window_size)] = _build_mask(
-                [*base_mods, get_sliding_window_mask_mod(window_size)]
-            )
+            masks[_window_mask_key(window_size)] = _build_mask(window_size)
 
         return masks
