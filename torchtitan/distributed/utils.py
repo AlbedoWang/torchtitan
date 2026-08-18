@@ -569,7 +569,7 @@ def set_pg_timeouts(
     parallel_dims: ParallelDims,
 ):
     """
-    Sets the timeout for all PGs in the provided mesh, and the default (world) group.
+    Sets the timeout for all PGs in the provided meshes, and the default (world) group.
 
     Note: synchronizes via a barrier, before changing the timeouts. This is important, because
     otherwise you may face a race where the slow rank has not reached the timeout reduction point
@@ -586,12 +586,21 @@ def set_pg_timeouts(
     torch.distributed.barrier(device_ids=[device_module.current_device()])
     device_module.synchronize()
 
-    # None represents the 'default' PG, not part of the mesh
+    # None represents the 'default' PG, not part of the meshes.
     groups: list[torch.distributed.ProcessGroup | None] = [
         mesh.get_group()
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
-    ] + [None]
+    ]
+    for mesh in parallel_dims.spmd_meshes():
+        groups.extend(mesh.get_all_groups())
+    groups.append(None)
+
+    unique_groups: list[torch.distributed.ProcessGroup | None] = []
     for group in groups:
+        if not any(group is existing_group for existing_group in unique_groups):
+            unique_groups.append(group)
+
+    for group in unique_groups:
         torch.distributed.set_timeout(timeout, group)
 
 
