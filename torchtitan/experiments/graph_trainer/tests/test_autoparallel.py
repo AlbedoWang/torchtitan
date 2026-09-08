@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.config import ConfigManager, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     validate_autoparallel_config,
@@ -75,6 +75,7 @@ class _FakeAutoParallelGraph:
         self.kwargs = kwargs
         self.used_fx_path = False
         self.optimize_calls = 0
+        self.optimize_kwargs = None
         self.sharding_optimizer = SimpleNamespace(
             load_placements=self._load_placements,
             save_placements=self._save_placements,
@@ -96,8 +97,9 @@ class _FakeAutoParallelGraph:
     def add_output_constraints(self, constraints):
         self.output_constraints = constraints
 
-    def optimize_placement(self, verbose=False):
+    def optimize_placement(self, **kwargs):
         self.optimize_calls += 1
+        self.optimize_kwargs = kwargs
         return object()
 
     def _load_placements(self, path):
@@ -286,6 +288,79 @@ def test_autoparallel_config_validation():
             )
         )
 
+    with pytest.raises(ValueError, match="lazy_costs lazy requires"):
+        validate_autoparallel_config(
+            GraphTrainerCompileConfig(
+                enable_autoparallel=True,
+                autoparallel_solver="ilp",
+                autoparallel_lazy_costs="lazy",
+            )
+        )
+
+    with pytest.raises(ValueError, match="strategy_radius must be non-negative"):
+        validate_autoparallel_config(
+            GraphTrainerCompileConfig(
+                enable_autoparallel=True,
+                autoparallel_solver="approx",
+                autoparallel_strategy_radius=-1,
+            )
+        )
+
+
+def test_autoparallel_solver_options_parse_from_cli():
+    config = (
+        ConfigManager()
+        .parse_args(
+            [
+                "--module",
+                "graph_trainer.llama3",
+                "--config",
+                "graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
+                "--compile.enable-autoparallel",
+                "--compile.autoparallel-solver",
+                "approx",
+                "--compile.no-autoparallel-fast-build",
+                "--compile.autoparallel-lazy-costs",
+                "eager",
+                "--compile.autoparallel-strategy-radius",
+                "1",
+                "--compile.autoparallel-optimality-check",
+                "--compile.autoparallel-approx-candidate-limit",
+                "64",
+                "--compile.autoparallel-approx-bp-iters",
+                "80",
+                "--compile.autoparallel-approx-bp-tol",
+                "0.002",
+                "--compile.autoparallel-approx-max-sweeps",
+                "6",
+                "--compile.autoparallel-approx-max-time-s",
+                "30",
+                "--compile.autoparallel-approx-star-passes",
+                "3",
+                "--compile.autoparallel-approx-max-star-children",
+                "16",
+                "--compile.autoparallel-approx-group-domain-limit",
+                "256",
+            ]
+        )
+        .compile
+    )
+
+    assert config.enable_autoparallel is True
+    assert config.autoparallel_solver == "approx"
+    assert config.autoparallel_fast_build is False
+    assert config.autoparallel_lazy_costs == "eager"
+    assert config.autoparallel_strategy_radius == 1
+    assert config.autoparallel_optimality_check is True
+    assert config.autoparallel_approx_candidate_limit == 64
+    assert config.autoparallel_approx_bp_iters == 80
+    assert config.autoparallel_approx_bp_tol == 0.002
+    assert config.autoparallel_approx_max_sweeps == 6
+    assert config.autoparallel_approx_max_time_s == 30.0
+    assert config.autoparallel_approx_star_passes == 3
+    assert config.autoparallel_approx_max_star_children == 16
+    assert config.autoparallel_approx_group_domain_limit == 256
+
 
 def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
     from torchtitan.experiments.graph_trainer import passes
@@ -434,6 +509,18 @@ def test_llama_3d_autoparallel_constraints_and_placement_io(
     compile_config = GraphTrainerCompileConfig(
         enable_autoparallel=True,
         autoparallel_solver="approx",
+        autoparallel_fast_build=False,
+        autoparallel_lazy_costs="eager",
+        autoparallel_strategy_radius=1,
+        autoparallel_optimality_check=True,
+        autoparallel_approx_candidate_limit=64,
+        autoparallel_approx_bp_iters=80,
+        autoparallel_approx_bp_tol=2e-3,
+        autoparallel_approx_max_sweeps=6,
+        autoparallel_approx_max_time_s=30.0,
+        autoparallel_approx_star_passes=3,
+        autoparallel_approx_max_star_children=16,
+        autoparallel_approx_group_domain_limit=256,
         autoparallel_placements_load_path=(
             str(placement_path) if use_saved_placements else ""
         ),
@@ -470,7 +557,9 @@ def test_llama_3d_autoparallel_constraints_and_placement_io(
         torch.distributed.tensor.Replicate(),
     ) * 2
     assert autop.kwargs["solver"] == "approx"
-    assert autop.kwargs["strategy_radius"] == (0 if use_saved_placements else 2)
+    assert autop.kwargs["fast_build"] is False
+    assert autop.kwargs["lazy_costs"] is False
+    assert autop.kwargs["strategy_radius"] == (0 if use_saved_placements else 1)
     assert autop.input_constraints == [expected, expected]
     assert autop.output_constraints == [expected]
     assert autop.apply_kwargs["model_output"] is None
@@ -481,6 +570,20 @@ def test_llama_3d_autoparallel_constraints_and_placement_io(
         assert autop.loaded_path == str(placement_path)
     else:
         assert autop.optimize_calls == 1
+        assert autop.optimize_kwargs == {
+            "verbose": False,
+            "approximate_options": {
+                "candidate_limit": 64,
+                "bp_iters": 80,
+                "bp_tol": 2e-3,
+                "max_sweeps": 6,
+                "max_time_s": 30.0,
+                "star_passes": 3,
+                "max_star_children": 16,
+                "group_domain_limit": 256,
+            },
+            "optimality_check": True,
+        }
         assert autop.saved_path == placement_path
 
 

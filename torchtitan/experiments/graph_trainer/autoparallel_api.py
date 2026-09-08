@@ -83,6 +83,53 @@ def autoparallel_manages_context_parallel_input(model: nn.Module) -> bool:
     return bool(getattr(model, _MANAGES_CONTEXT_PARALLEL_INPUT_ATTR, True))
 
 
+def autoparallel_constructor_kwargs(
+    compile_config: GraphTrainerCompileConfig,
+) -> dict[str, object]:
+    """Translate graph_trainer config into AutoParallel constructor options."""
+    lazy_costs = {
+        "auto": None,
+        "lazy": True,
+        "eager": False,
+    }[compile_config.autoparallel_lazy_costs]
+    strategy_radius = (
+        0
+        if compile_config.autoparallel_placements_load_path
+        else compile_config.autoparallel_strategy_radius
+    )
+    return {
+        "solver": compile_config.autoparallel_solver,
+        "fast_build": compile_config.autoparallel_fast_build,
+        "lazy_costs": lazy_costs,
+        "strategy_radius": strategy_radius,
+    }
+
+
+def autoparallel_optimize_kwargs(
+    compile_config: GraphTrainerCompileConfig,
+) -> dict[str, object]:
+    """Translate graph_trainer config into AutoParallel solve options."""
+    approximate_options = None
+    if compile_config.autoparallel_solver == "approx":
+        approximate_options = {
+            "candidate_limit": compile_config.autoparallel_approx_candidate_limit,
+            "bp_iters": compile_config.autoparallel_approx_bp_iters,
+            "bp_tol": compile_config.autoparallel_approx_bp_tol,
+            "max_sweeps": compile_config.autoparallel_approx_max_sweeps,
+            "max_time_s": compile_config.autoparallel_approx_max_time_s,
+            "star_passes": compile_config.autoparallel_approx_star_passes,
+            "max_star_children": (compile_config.autoparallel_approx_max_star_children),
+            "group_domain_limit": (
+                compile_config.autoparallel_approx_group_domain_limit
+            ),
+        }
+    return {
+        "verbose": False,
+        "approximate_options": approximate_options,
+        "optimality_check": compile_config.autoparallel_optimality_check,
+    }
+
+
 class AutoParallelGraph(AutoParallel):
     """AutoParallel variant for graph_trainer's ``aot_fx_trace`` pipeline."""
 

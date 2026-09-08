@@ -31,7 +31,11 @@ from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
-from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
+from torchtitan.experiments.graph_trainer.autoparallel_api import (
+    AutoParallelGraph,
+    autoparallel_constructor_kwargs,
+    autoparallel_optimize_kwargs,
+)
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
@@ -320,8 +324,7 @@ def parallelize_autoparallel_deepseekv3(
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
         dynamic=True,
-        solver=compile_config.autoparallel_solver,
-        strategy_radius=(0 if compile_config.autoparallel_placements_load_path else 2),
+        **autoparallel_constructor_kwargs(compile_config),
     )
 
     annotate_deepseekv3_for_graph_trainer(autop.model)
@@ -341,7 +344,9 @@ def parallelize_autoparallel_deepseekv3(
             )
         else:
             t0 = time.time()
-            sharding_placement = autop.optimize_placement(verbose=False)
+            sharding_placement = autop.optimize_placement(
+                **autoparallel_optimize_kwargs(compile_config)
+            )
             t1 = time.time()
             logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
 

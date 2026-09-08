@@ -28,6 +28,8 @@ from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.autoparallel_api import (
     AutoParallelGraph,
     AutoParallelModelOutput,
+    autoparallel_constructor_kwargs,
+    autoparallel_optimize_kwargs,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import (
@@ -240,8 +242,7 @@ def parallelize_autoparallel_llama(
         dense_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
-        solver=compile_config.autoparallel_solver,
-        strategy_radius=(0 if compile_config.autoparallel_placements_load_path else 2),
+        **autoparallel_constructor_kwargs(compile_config),
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints([x_sharding, x_sharding])
@@ -257,7 +258,9 @@ def parallelize_autoparallel_llama(
             )
         else:
             t0 = time.time()
-            sharding_placement = autop.optimize_placement(verbose=False)
+            sharding_placement = autop.optimize_placement(
+                **autoparallel_optimize_kwargs(compile_config)
+            )
             t1 = time.time()
             logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
 

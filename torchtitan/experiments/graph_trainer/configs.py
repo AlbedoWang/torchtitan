@@ -172,6 +172,42 @@ class GraphTrainerCompileConfig(CompileConfig):
     autoparallel_solver: Literal["ilp", "approx", "lp"] = "ilp"
     """Placement solver used by AutoParallel."""
 
+    autoparallel_fast_build: bool = True
+    """Use AutoParallel's reduced-cost optimizer construction path."""
+
+    autoparallel_lazy_costs: Literal["auto", "lazy", "eager"] = "auto"
+    """Cost construction mode; ``auto`` selects the solver default."""
+
+    autoparallel_strategy_radius: int = 2
+    """Approximate N-D search radius. Set to zero for unrestricted search."""
+
+    autoparallel_optimality_check: bool = False
+    """Ask AutoParallel to compute an LP lower bound after solving."""
+
+    autoparallel_approx_candidate_limit: int | None = 128
+    """Per-node candidate cap for the approximate solver."""
+
+    autoparallel_approx_bp_iters: int = 400
+    """Maximum belief-propagation iterations per approximate solve."""
+
+    autoparallel_approx_bp_tol: float = 1e-3
+    """Belief-propagation convergence tolerance."""
+
+    autoparallel_approx_max_sweeps: int = 12
+    """Maximum repair sweeps for the approximate solver."""
+
+    autoparallel_approx_max_time_s: float = 60.0
+    """Approximate solver wall-clock budget in seconds."""
+
+    autoparallel_approx_star_passes: int = 2
+    """Number of approximate star-refinement passes."""
+
+    autoparallel_approx_max_star_children: int = 32
+    """Maximum children in one approximate star refinement."""
+
+    autoparallel_approx_group_domain_limit: int = 512
+    """Maximum candidate assignments retained for a grouped domain."""
+
     autoparallel_placements_save_path: str = ""
     """Save solved AutoParallel placements to this JSON path."""
 
@@ -201,6 +237,19 @@ def validate_autoparallel_config(
         raise ValueError(
             "AutoParallel placement paths require --compile.enable_autoparallel"
         )
+    if (
+        compile_config.autoparallel_lazy_costs == "lazy"
+        and compile_config.autoparallel_solver != "approx"
+    ):
+        raise ValueError(
+            "--compile.autoparallel_lazy_costs lazy requires "
+            "--compile.autoparallel_solver approx"
+        )
+    if (
+        compile_config.autoparallel_solver == "approx"
+        and compile_config.autoparallel_strategy_radius < 0
+    ):
+        raise ValueError("--compile.autoparallel_strategy_radius must be non-negative")
 
 
 def validate_ep_overlap_config(
