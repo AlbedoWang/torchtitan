@@ -51,6 +51,28 @@ def graph_trainer_deepseek_v3_debugmodel_sdpa_cross_entropy_loss() -> GraphTrain
     return config
 
 
+def graph_trainer_deepseek_v3_debugmodel_flex_cp32k() -> GraphTrainer.Config:
+    """Integration-only FlexAttention config for the 32K CP4 validation."""
+    config = graph_trainer_deepseek_v3_debugmodel()
+    assert config.model_spec is not None
+    for layer in config.model_spec.model.layers:
+        layer.attention.rope.max_seq_len = 32768
+    config.loss = CrossEntropyLoss.Config(
+        global_vocab_size=decoder_vocab_size(config.model_spec),
+    )
+    config.training.local_batch_size = 1
+    config.training.seq_len = 32768
+    config.training.steps = 2
+    config.parallelism.data_parallel_replicate_degree = 1
+    config.parallelism.data_parallel_shard_degree = 1
+    config.parallelism.context_parallel_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 8
+    config.parallelism.context_parallel_load_balancer = None
+    config.compile.autoparallel_solver = "approx"
+    return config
+
+
 def graph_trainer_deepseek_v3_debugmodel_mxfp8() -> GraphTrainer.Config:
     base = deepseek_v3_debugmodel()
     # Quantize dense and moe gemms to mxfp8

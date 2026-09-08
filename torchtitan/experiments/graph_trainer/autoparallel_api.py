@@ -21,6 +21,11 @@ from torchtitan.experiments.graph_trainer.common_utils import annotate_module_fq
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
 
+_MANAGES_CONTEXT_PARALLEL_INPUT_ATTR = (
+    "_torchtitan_autoparallel_manages_context_parallel_input"
+)
+
+
 @dataclass(frozen=True)
 class AutoParallelModelOutput:
     output_mesh: DeviceMesh
@@ -73,6 +78,11 @@ def _wrap_autoparallel_output(
     )
 
 
+def autoparallel_manages_context_parallel_input(model: nn.Module) -> bool:
+    """Return whether an AutoParallel model owns CP input preprocessing."""
+    return bool(getattr(model, _MANAGES_CONTEXT_PARALLEL_INPUT_ATTR, True))
+
+
 class AutoParallelGraph(AutoParallel):
     """AutoParallel variant for graph_trainer's ``aot_fx_trace`` pipeline."""
 
@@ -86,6 +96,7 @@ class AutoParallelGraph(AutoParallel):
         *,
         compile_config: GraphTrainerCompileConfig,
         model_output: AutoParallelModelOutput | None = None,
+        manages_context_parallel_input: bool = True,
     ) -> nn.Module:
         """Return an AOT-backed parallel module for graph_trainer tracing.
 
@@ -113,11 +124,9 @@ class AutoParallelGraph(AutoParallel):
         # _compute_expected_inputs (which had an unstable signature across
         # versions and was removed from autoparallel main).
         num_expected_inputs = len(get_plain_input_and_grad_nodes(self.gm.graph))
+        has_traced_kwargs = bool(self._traced_inputs.kwargs)
 
         def forward(self, *args, **kwargs):
-            flat_args, _ = torch.utils._pytree.tree_flatten(args)
-            if len(flat_args) != num_expected_inputs:
-                flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
             params = [
                 _local_tensor_with_autograd(
                     _get_raw_module_tensor(self, fqn, is_buffer=False)
@@ -129,14 +138,26 @@ class AutoParallelGraph(AutoParallel):
                 )
                 for fqn in graph_buffer_fqns
             ]
-            boxed_args = [*params, *flat_args]
+            if has_traced_kwargs:
+                output = parallel_model_fn(*params, *args, **kwargs)
+            else:
+                flat_args, _ = torch.utils._pytree.tree_flatten(args)
+                if len(flat_args) != num_expected_inputs:
+                    flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
+                boxed_args = [*params, *flat_args]
+                output = parallel_model_fn(boxed_args)
             del params
-            output = parallel_model_fn(boxed_args)
             return _wrap_autoparallel_output(output, model_output)
 
-        return make_parallel_module(
+        parallel_model = make_parallel_module(
             self.model,
             sharded_param_dict,
             sharded_buffer_dict,
             forward_fn=forward,
         )
+        setattr(
+            parallel_model,
+            _MANAGES_CONTEXT_PARALLEL_INPUT_ATTR,
+            manages_context_parallel_input,
+        )
+        return parallel_model

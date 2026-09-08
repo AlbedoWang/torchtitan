@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.utils._pytree as pytree
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -36,6 +37,7 @@ from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     validate_autoparallel_config,
 )
+from torchtitan.models.common.attention import FlexAttention, ScaledDotProductAttention
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_type
 
@@ -47,6 +49,7 @@ def _load_autoparallel_dsv3_dependency():
         from autoparallel._testing.models.dsv3 import (
             annotate_deepseekv3_for_graph_trainer,
             DeepSeekV3Model,
+            FlexAttentionConfig,
             make_dsv3_config,
         )
     except ImportError as exc:
@@ -60,11 +63,16 @@ def _load_autoparallel_dsv3_dependency():
         DeepSeekV3Model,
         annotate_deepseekv3_for_graph_trainer,
         build_moe_mesh,
+        FlexAttentionConfig,
         make_dsv3_config,
     )
 
 
-def _to_autoparallel_dsv3_config(config, make_dsv3_config):
+def _to_autoparallel_dsv3_config(
+    config,
+    make_dsv3_config,
+    FlexAttentionConfig,
+):
     """Translate the current TorchTitan DSv3 config to AP's test-model config."""
     if hasattr(config, "rope"):
         return config
@@ -100,6 +108,18 @@ def _to_autoparallel_dsv3_config(config, make_dsv3_config):
         )
 
     rope = first_attention.rope
+    source_inner_attention = first_attention.inner_attention
+    inner_attention = None
+    if isinstance(source_inner_attention, FlexAttention.Config):
+        inner_attention = FlexAttentionConfig(
+            block_size=source_inner_attention.block_size,
+            kernel_options=dict(source_inner_attention.kernel_options),
+        )
+    elif not isinstance(source_inner_attention, ScaledDotProductAttention.Config):
+        raise ValueError(
+            "AutoParallel DeepSeek V3 supports FlexAttention and SDPA only, got "
+            f"{type(source_inner_attention).__qualname__}."
+        )
     ap_config = make_dsv3_config(
         dim=config.dim,
         vocab_size=config.vocab_size,
@@ -129,6 +149,7 @@ def _to_autoparallel_dsv3_config(config, make_dsv3_config):
         beta_slow=rope.beta_slow,
         original_seq_len=rope.original_seq_len,
         load_balance_coeff=first_moe.load_balance_coeff,
+        inner_attention=inner_attention,
     )
     ap_config.norm.eps = config.norm.eps
     for source_layer, ap_layer in zip(layers, ap_config.layers, strict=True):
@@ -218,6 +239,7 @@ def parallelize_autoparallel_deepseekv3(
         APDeepSeekV3Model,
         annotate_deepseekv3_for_graph_trainer,
         build_moe_mesh,
+        APFlexAttentionConfig,
         make_dsv3_config,
     ) = _load_autoparallel_dsv3_dependency()
 
@@ -232,7 +254,11 @@ def parallelize_autoparallel_deepseekv3(
 
     # Use AutoParallel's DSv3 model: torchtitan's token_dispatcher uses
     # aten::div.Tensor_mode which the AP solver doesn't support yet.
-    ap_model_config = _to_autoparallel_dsv3_config(model.config, make_dsv3_config)
+    ap_model_config = _to_autoparallel_dsv3_config(
+        model.config,
+        make_dsv3_config,
+        APFlexAttentionConfig,
+    )
     with torch.device("meta"):
         ap_model = APDeepSeekV3Model(
             ap_model_config,
@@ -241,18 +267,40 @@ def parallelize_autoparallel_deepseekv3(
             compute_dtype=param_dtype,
         )
 
+    from autoparallel import ForwardInputs
+
+    global_batch_size = training.global_batch_size
+    if global_batch_size < 0:
+        dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
+        global_batch_size = training.local_batch_size * dp_degree
+    sample_tokens = torch.randint(
+        0,
+        ap_model.model_args.vocab_size,
+        (global_batch_size, training.seq_len),
+        device=torch.device(device_type),
+    )
+    sample_positions = torch.arange(
+        training.seq_len,
+        dtype=torch.int64,
+        device=torch.device(device_type),
+    ).expand(global_batch_size, -1)
+    sample_attention_masks = ap_model.get_attention_masks(sample_positions)
+    if sample_attention_masks is not None:
+        ap_model.set_context_parallel_block_mask_template(sample_attention_masks)
+    sample_inputs = ForwardInputs(
+        args=(sample_tokens,),
+        kwargs={
+            "positions": sample_positions,
+            "attention_masks": sample_attention_masks,
+        },
+    )
+    flat_inputs, _ = pytree.tree_flatten((sample_inputs.args, sample_inputs.kwargs))
+    input_constraint_count = sum(
+        isinstance(value, torch.Tensor) for value in flat_inputs
+    )
+
     def input_fn():
-        global_batch_size = training.global_batch_size
-        if global_batch_size < 0:
-            dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = training.local_batch_size * dp_degree
-        tokens = torch.randint(
-            0,
-            ap_model.model_args.vocab_size,
-            (global_batch_size, training.seq_len),
-            device=torch.device(device_type),
-        )
-        return tokens
+        return sample_inputs
 
     data_parallel_axes = {
         "dp_replicate",
@@ -280,7 +328,7 @@ def parallelize_autoparallel_deepseekv3(
 
     with autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
-        autop.add_input_constraints([x_sharding])
+        autop.add_input_constraints([x_sharding] * input_constraint_count)
         autop.add_output_constraints([x_sharding])
 
         if compile_config.autoparallel_placements_load_path:
@@ -312,6 +360,7 @@ def parallelize_autoparallel_deepseekv3(
         parallel_mod = autop.apply_placement_for_fx_module(
             sharding_placement,
             compile_config=compile_config,
+            manages_context_parallel_input=True,
         )
 
     _set_torchtitan_fields(parallel_mod)

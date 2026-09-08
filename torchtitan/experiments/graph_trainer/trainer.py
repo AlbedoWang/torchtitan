@@ -6,11 +6,13 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.graph_trainer.common_utils import (
     accumulate_param_grads_,
     compute_annotated_loss,
@@ -127,13 +129,24 @@ class GraphTrainer(Trainer):
         POST_INIT_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(self)
 
     def _context_parallel_input_enabled(self) -> bool:
-        return (
-            super()._context_parallel_input_enabled()
-            and not self.config.compile.enable_autoparallel
+        if not super()._context_parallel_input_enabled():
+            return False
+        if not self.config.compile.enable_autoparallel:
+            return True
+
+        from torchtitan.experiments.graph_trainer.autoparallel_api import (
+            autoparallel_manages_context_parallel_input,
         )
 
+        assert len(self.model_parts) == 1
+        return not autoparallel_manages_context_parallel_input(self.model_parts[0])
+
     def _metrics_loss_mesh(self):
-        if self.config.compile.enable_autoparallel and self.parallel_dims.cp_enabled:
+        if (
+            self.config.compile.enable_autoparallel
+            and self.parallel_dims.cp_enabled
+            and not self._context_parallel_input_enabled()
+        ):
             return self.parallel_dims.get_optional_mesh("batch")
         return super()._metrics_loss_mesh()
 
@@ -246,6 +259,11 @@ class GraphTrainer(Trainer):
                     passes,
                     compile_config=self.config.compile,
                 )
+
+            dist_utils.set_pg_timeouts(
+                timeout=timedelta(seconds=self.config.comm.init_timeout_seconds),
+                parallel_dims=self.parallel_dims,
+            )
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
                 inputs,

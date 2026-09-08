@@ -19,6 +19,7 @@ from torch.distributed.tensor.experimental._attention import (
     _PTRRLoadBalancer,
 )
 from torch.distributed.tensor.experimental._context_parallel._attention import (
+    _context_parallel_buffers,
     flex_cp_allgather,
 )
 from torch.nn.attention.flex_attention import BlockMask
@@ -283,10 +284,14 @@ def cp_shard(
             if isinstance(attention_masks, BlockMask)
             else list(attention_masks.values())
         )
-        masks = _context_parallel_shard(
+        # Keep BlockMask objects intact here. FlexAttention compilation can
+        # register BlockMask as a pytree node after the first training step;
+        # routing masks through _context_parallel_shard would then flatten
+        # their tensor fields while seq_dims still describes one mask.
+        masks = _context_parallel_buffers(
             mesh=cp_mesh,
             buffers=masks,
-            seq_dims=(MASK_Q_SEQ_DIM,) * len(masks),
+            buffer_seq_dims=[MASK_Q_SEQ_DIM] * len(masks),
             load_balancer=load_balancer,
         )
         attention_masks = cast(

@@ -611,7 +611,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             base_folder=config.dump_folder,
         )
 
-        return ParallelDims.from_config(config.parallelism, world_size)
+        parallel_dims = ParallelDims.from_config(config.parallelism, world_size)
+        dist_utils.set_pg_timeouts(
+            timeout=timedelta(seconds=config.comm.init_timeout_seconds),
+            parallel_dims=parallel_dims,
+        )
+        return parallel_dims
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
