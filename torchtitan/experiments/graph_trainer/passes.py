@@ -64,6 +64,7 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
     isolate_ep_process_group_pass,
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    autobucketing_reordering_pass,
     deduplicate_fsdp_unshard_chains_pass,
     get_fsdp_param_module_order,
     get_transformer_block_bucket_counts,
@@ -273,17 +274,21 @@ def compile_time_passes(
 
     if config.compile.enable_fsdp_ag_rs_overlap:
         passes.append(reassign_collective_pgs_pass)
-    passes.append(
-        functools.partial(
-            joint_transformer_block_bucketing_reordering_pass,
-            module_bucket_plans=module_bucket_plans,
-            # FSDP2 packs buckets in managed parameter order. The traced state
-            # FQNs preserve that registration order, unlike graph execution order.
-            fsdp_param_module_order=get_fsdp_param_module_order(
-                traced_result.state_fqns
-            ),
+    if config.compile.enable_autoparallel:
+        if config.compile.inductor_compilation == "regional":
+            passes.append(autobucketing_reordering_pass)
+    else:
+        passes.append(
+            functools.partial(
+                joint_transformer_block_bucketing_reordering_pass,
+                module_bucket_plans=module_bucket_plans,
+                # FSDP2 packs buckets in managed parameter order. The traced state
+                # FQNs preserve that registration order, unlike graph execution order.
+                fsdp_param_module_order=get_fsdp_param_module_order(
+                    traced_result.state_fqns
+                ),
+            )
         )
-    )
 
     if ep_overlap_enabled:
         assert ep_overlap_module_fqn is not None
@@ -340,10 +345,37 @@ def compile_time_passes(
     if not include_inductor:
         return passes
 
+    full_inductor_configs = None
+    if (
+        config.compile.enable_autoparallel
+        and config.compile.inductor_compilation == "full"
+    ):
+        if parallel_dims is None:
+            raise ValueError(
+                "AutoParallel full Inductor compilation requires ParallelDims"
+            )
+        ep_mesh = parallel_dims.get_optional_mesh("ep")
+        if ep_mesh is not None:
+            mesh_axes = ["efsdp", "ep"]
+        else:
+            mesh_axes = [
+                name
+                for name in ("dp_replicate", "fsdp", "tp")
+                if parallel_dims.get_optional_mesh(name) is not None
+            ]
+        from torchtitan.experiments.graph_trainer.autoparallel_api import (
+            _autoparallel_inductor_configs,
+        )
+
+        full_inductor_configs = _autoparallel_inductor_configs(
+            parallel_dims.get_mesh(mesh_axes)
+        )
+
     passes.extend(
         final_inductor_compile_passes(
             config.compile,
             use_cudagraph=use_cudagraph,
+            full_inductor_configs=full_inductor_configs,
         )
     )
     return passes
@@ -354,6 +386,7 @@ def final_inductor_compile_passes(
     *,
     use_cudagraph: bool = False,
     boxed_codegen: bool = False,
+    full_inductor_configs: dict | None = None,
 ) -> list[Callable]:
     """Return the terminal Inductor passes for a traced graph.
 
@@ -374,6 +407,7 @@ def final_inductor_compile_passes(
             functools.partial(
                 full_inductor_compilation_pass,
                 boxed_codegen=boxed_codegen,
+                inductor_configs=full_inductor_configs,
             )
         )
     elif inductor_compilation == "regional":
