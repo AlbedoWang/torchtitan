@@ -708,6 +708,45 @@ def test_llama_3d_autoparallel_constraints_and_placement_io(
         assert autop.saved_path == placement_path
 
 
+def test_llama_autoparallel_traces_one_distributed_microbatch():
+    from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
+
+    _FakeAutoParallelGraph.instances.clear()
+    training = TrainingConfig(
+        local_batch_size=2,
+        global_batch_size=64,
+        seq_len=8,
+        mixed_precision_param="bfloat16",
+        mixed_precision_reduce="float32",
+    )
+    parallel_dims = _FakeParallelDims()
+    parallel_dims.dp_shard = 4
+    parallel_dims.tp = 8
+
+    with (
+        patch.object(
+            parallelize_autoparallel, "AutoParallelGraph", _FakeAutoParallelGraph
+        ),
+        patch.object(
+            parallelize_autoparallel, "apply_compile", lambda model, **_: model
+        ),
+        patch.object(parallelize_autoparallel, "device_type", "cpu"),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_llama(
+            SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
+            parallel_dims=parallel_dims,
+            training=training,
+            parallelism=ParallelismConfig(),
+            compile_config=GraphTrainerCompileConfig(enable_autoparallel=True),
+            ac_config=object(),
+            dump_folder="",
+        )
+
+    tokens, positions = _FakeAutoParallelGraph.instances[0].input_fn()
+    assert tokens.shape == (8, 8)
+    assert positions.shape == (8, 8)
+
+
 @pytest.mark.parametrize("use_saved_placements", [False, True])
 def test_llama_dp_shard_cp_tp_autoparallel_constraints_and_placement_io(
     tmp_path, use_saved_placements
