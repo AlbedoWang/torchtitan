@@ -870,6 +870,13 @@ def test_muse_glimmer_autoparallel_constraints_and_placement_io(
             layers=[SimpleNamespace(attention=SimpleNamespace(window_size=3))],
         )
     )
+    training = TrainingConfig(
+        local_batch_size=2,
+        global_batch_size=64,
+        seq_len=8,
+        mixed_precision_param="bfloat16",
+        mixed_precision_reduce="float32",
+    )
 
     with (
         patch.object(
@@ -883,7 +890,7 @@ def test_muse_glimmer_autoparallel_constraints_and_placement_io(
         parallelize_autoparallel.parallelize_autoparallel_muse_glimmer(
             model,
             parallel_dims=_FakeParallelDims(),
-            training=_training_config(),
+            training=training,
             parallelism=ParallelismConfig(),
             compile_config=compile_config,
             ac_config=object(),
@@ -911,6 +918,8 @@ def test_muse_glimmer_autoparallel_constraints_and_placement_io(
     assert model_output.output_placements == (torch.distributed.tensor.Shard(2),)
     assert model_output.sharded_output_axis == 2
 
+    assert traced_inputs.args[0].shape == (4, 8)
+    assert traced_inputs.kwargs["positions"].shape == (4, 8)
     assert traced_inputs.kwargs["positions"].dtype is torch.int64
     assert set(traced_inputs.kwargs["attention_masks"]) == {"global", "swa_3"}
 
