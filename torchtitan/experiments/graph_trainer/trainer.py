@@ -155,7 +155,7 @@ class GraphTrainer(Trainer):
         *,
         input_dict: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
         labels: torch.Tensor | list[torch.Tensor],
-        global_valid_tokens: float,
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         if self.parallel_dims.pp_enabled or self.config.compile.mode != "aot_fx_trace":
             return super().forward_backward_step(
@@ -219,7 +219,7 @@ class GraphTrainer(Trainer):
         model: nn.Module,
         inputs: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: torch.Tensor,
         params: list[torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
@@ -247,11 +247,21 @@ class GraphTrainer(Trainer):
                     self.config.compile.pass_pipeline,
                     construct_default_graph_passes,
                 )
-                passes = pipeline_fn(
-                    self._traced_step,
-                    self.config,
-                    parallel_dims=self.parallel_dims,
-                )
+                if pipeline_fn is construct_default_graph_passes:
+                    passes = pipeline_fn(
+                        self._traced_step,
+                        self.config,
+                        parallel_dims=self.parallel_dims,
+                        autoparallel_mesh=getattr(
+                            model, "_graph_trainer_autoparallel_mesh", None
+                        ),
+                    )
+                else:
+                    passes = pipeline_fn(
+                        self._traced_step,
+                        self.config,
+                        parallel_dims=self.parallel_dims,
+                    )
 
                 self._traced_step.gm = apply_graph_passes(
                     self._traced_step.gm,

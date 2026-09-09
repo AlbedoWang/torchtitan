@@ -392,7 +392,7 @@ def test_autoparallel_regional_pass_selection_uses_auto_bucketing():
     assert passes.joint_transformer_block_bucketing_reordering_pass not in pass_fns
 
 
-def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
+def test_autoparallel_full_pass_injects_backend_inductor_configs():
     from torchtitan.experiments.graph_trainer import passes
 
     traced_result = SimpleNamespace(
@@ -413,9 +413,24 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
         ),
     )
 
-    graph_passes = passes.construct_default_graph_passes(
-        traced_result, config, parallel_dims=_FakeParallelDims()
-    )
+    autoparallel_mesh = object()
+    expected_configs = {
+        "aten_distributed_optimizations.enable_overlap_scheduling": True,
+    }
+
+    with patch(
+        "torchtitan.experiments.graph_trainer.autoparallel_api."
+        "_autoparallel_inductor_configs",
+        return_value=expected_configs,
+    ) as configs:
+        graph_passes = passes.construct_default_graph_passes(
+            traced_result,
+            config,
+            parallel_dims=_FakeParallelDims(),
+            autoparallel_mesh=autoparallel_mesh,
+        )
+
+    configs.assert_called_once_with(autoparallel_mesh)
     pass_fns = [getattr(pass_fn, "func", pass_fn) for pass_fn in graph_passes]
 
     assert passes.autobucketing_reordering_pass not in pass_fns
@@ -425,16 +440,36 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
         for pass_fn in graph_passes
         if getattr(pass_fn, "func", pass_fn) is passes.full_inductor_compilation_pass
     )
-    configs = full_pass.keywords["inductor_configs"]
-    assert configs["aten_distributed_optimizations.enable_overlap_scheduling"] is True
-    assert configs["aten_distributed_optimizations.collective_bucketing"] is True
-    assert configs["aten_distributed_optimizations.insert_overlap_deps"] is True
-    assert configs["aten_distributed_optimizations.max_compute_pre_fetch"] == 10
-    assert configs["reorder_for_peak_memory"] is False
-    assert configs["reorder_for_compute_comm_overlap"] is False
-    custom_pass = configs["post_grad_custom_post_pass"]
-    assert custom_pass.func.__name__ == "aten_autobucketing_reordering_pass"
-    assert custom_pass.keywords["configs"].custom_runtime_estimation is not None
+    assert full_pass.keywords["inductor_configs"] is expected_configs
+
+
+def test_autoparallel_full_pass_requires_runtime_mesh():
+    from torchtitan.experiments.graph_trainer import passes
+
+    traced_result = SimpleNamespace(
+        gm=torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph()),
+        state_fqns=[],
+    )
+    config = SimpleNamespace(
+        compile=GraphTrainerCompileConfig(
+            enable_autoparallel=True,
+            disable_passes=["cudagraph_pass"],
+            inductor_compilation="full",
+        ),
+        model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
+        parallelism=SimpleNamespace(
+            enable_async_tensor_parallel=False,
+            fsdp_reshard_after_forward="always",
+            pipeline_parallel_degree=1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires its runtime mesh"):
+        passes.construct_default_graph_passes(
+            traced_result,
+            config,
+            parallel_dims=_FakeParallelDims(),
+        )
 
 
 def test_autoparallel_graph_preserves_copied_model_fqns():
@@ -758,6 +793,225 @@ def test_llama_dp_shard_cp_tp_autoparallel_constraints_and_placement_io(
         assert autop.saved_path == placement_path
 
 
+@pytest.mark.parametrize("use_saved_placements", [False, True])
+def test_muse_glimmer_autoparallel_constraints_and_placement_io(
+    tmp_path, use_saved_placements
+):
+    from torchtitan.experiments.graph_trainer.muse_glimmer import (
+        parallelize_autoparallel,
+    )
+
+    _FakeAutoParallelGraph.instances.clear()
+    placement_path = tmp_path / "placements.json"
+    compile_config = GraphTrainerCompileConfig(
+        enable_autoparallel=True,
+        autoparallel_solver="approx",
+        autoparallel_fast_build=False,
+        autoparallel_lazy_costs="eager",
+        autoparallel_strategy_radius=1,
+        autoparallel_optimality_check=True,
+        autoparallel_approx_candidate_limit=64,
+        autoparallel_approx_bp_iters=80,
+        autoparallel_approx_bp_tol=2e-3,
+        autoparallel_approx_max_sweeps=6,
+        autoparallel_approx_max_time_s=30.0,
+        autoparallel_approx_star_passes=3,
+        autoparallel_approx_max_star_children=16,
+        autoparallel_approx_group_domain_limit=256,
+        autoparallel_placements_load_path=(
+            str(placement_path) if use_saved_placements else ""
+        ),
+        autoparallel_placements_save_path=(
+            "" if use_saved_placements else str(placement_path)
+        ),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size=16,
+            layers=[SimpleNamespace(attention=SimpleNamespace(window_size=3))],
+        )
+    )
+
+    with (
+        patch.object(
+            parallelize_autoparallel, "AutoParallelGraph", _FakeAutoParallelGraph
+        ),
+        patch.object(
+            parallelize_autoparallel, "apply_compile", lambda model, **_: model
+        ),
+        patch.object(parallelize_autoparallel, "device_type", "cpu"),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_muse_glimmer(
+            model,
+            parallel_dims=_FakeParallelDims(),
+            training=_training_config(),
+            parallelism=ParallelismConfig(),
+            compile_config=compile_config,
+            ac_config=object(),
+            dump_folder="",
+        )
+        traced_inputs = _FakeAutoParallelGraph.instances[0].input_fn()
+
+    autop = _FakeAutoParallelGraph.instances[0]
+    input_sharding = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Replicate(),
+    )
+    output_sharding = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Shard(2),
+    )
+    assert autop.kwargs["solver"] == "approx"
+    assert autop.kwargs["fast_build"] is False
+    assert autop.kwargs["lazy_costs"] is False
+    assert autop.kwargs["strategy_radius"] == (0 if use_saved_placements else 1)
+    assert autop.kwargs["repeated_subgraphs"] is True
+    assert autop.input_constraints == [input_sharding] * 4
+    assert autop.output_constraints == [output_sharding]
+    model_output = autop.apply_kwargs["model_output"]
+    assert model_output.output_placements == (torch.distributed.tensor.Shard(2),)
+    assert model_output.sharded_output_axis == 2
+
+    assert traced_inputs.kwargs["positions"].dtype is torch.int64
+    assert set(traced_inputs.kwargs["attention_masks"]) == {"global", "swa_3"}
+
+    if use_saved_placements:
+        assert autop.optimize_calls == 0
+        assert autop.loaded_path == str(placement_path)
+    else:
+        assert autop.optimize_calls == 1
+        assert autop.optimize_kwargs == {
+            "verbose": False,
+            "approximate_options": {
+                "candidate_limit": 64,
+                "bp_iters": 80,
+                "bp_tol": 2e-3,
+                "max_sweeps": 6,
+                "max_time_s": 30.0,
+                "star_passes": 3,
+                "max_star_children": 16,
+                "group_domain_limit": 256,
+            },
+            "optimality_check": True,
+        }
+        assert autop.saved_path == placement_path
+
+
+def test_muse_glimmer_packed_document_masks():
+    from torchtitan.experiments.graph_trainer.muse_glimmer.sdpa import (
+        build_packed_document_attention_masks,
+    )
+
+    positions = torch.tensor([[0, 1, 2, 0, 1]])
+    masks = build_packed_document_attention_masks(positions, {2})
+
+    expected_global = torch.tensor(
+        [
+            [
+                [True, False, False, False, False],
+                [True, True, False, False, False],
+                [True, True, True, False, False],
+                [False, False, False, True, False],
+                [False, False, False, True, True],
+            ]
+        ]
+    ).unsqueeze(1)
+    expected_sliding = torch.tensor(
+        [
+            [
+                [True, False, False, False, False],
+                [True, True, False, False, False],
+                [False, True, True, False, False],
+                [False, False, False, True, False],
+                [False, False, False, True, True],
+            ]
+        ]
+    ).unsqueeze(1)
+    torch.testing.assert_close(masks["global"], expected_global)
+    torch.testing.assert_close(masks["swa_2"], expected_sliding)
+
+
+def test_muse_glimmer_packed_document_masks_require_batched_positions():
+    from torchtitan.experiments.graph_trainer.muse_glimmer.sdpa import (
+        build_packed_document_attention_masks,
+    )
+
+    with pytest.raises(ValueError, match=r"shape \[batch, sequence\]"):
+        build_packed_document_attention_masks(torch.arange(4), set())
+
+
+def test_muse_glimmer_packed_document_sdpa_uses_tensor_mask():
+    import torch.nn.functional as F
+
+    from torchtitan.experiments.graph_trainer.muse_glimmer.sdpa import (
+        build_packed_document_attention_masks,
+        MuseGlimmerPackedDocumentSDPA,
+    )
+
+    attention = MuseGlimmerPackedDocumentSDPA(MuseGlimmerPackedDocumentSDPA.Config())
+    q = torch.randn(1, 5, 2, 4)
+    k = torch.randn(1, 5, 2, 4)
+    v = torch.randn(1, 5, 2, 4)
+    mask = build_packed_document_attention_masks(
+        torch.tensor([[0, 1, 2, 0, 1]]), set()
+    )["global"]
+
+    actual = attention(q, k, v, attention_masks=mask)
+    expected = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=mask,
+        is_causal=False,
+    ).transpose(1, 2)
+
+    torch.testing.assert_close(actual, expected)
+    with pytest.raises(TypeError, match="requires a Tensor attention mask"):
+        attention(q, k, v, attention_masks={})
+    with pytest.raises(ValueError, match="requires a boolean attention mask"):
+        attention(q, k, v, attention_masks=mask.float())
+
+
+def test_muse_glimmer_packed_document_sdpa_replaces_every_attention():
+    from torchtitan.experiments.graph_trainer.muse_glimmer.sdpa import (
+        MuseGlimmerPackedDocumentSDPA,
+        set_model_spec_packed_document_sdpa,
+    )
+    from torchtitan.models.muse_glimmer import model_registry
+
+    model_spec = set_model_spec_packed_document_sdpa(
+        model_registry("debugmodel", attn_backend="flex")
+    )
+
+    assert {
+        type(layer.attention.inner_attention) for layer in model_spec.model.layers
+    } == {MuseGlimmerPackedDocumentSDPA.Config}
+
+
+def test_muse_glimmer_paired_configs_only_change_autoparallel():
+    from dataclasses import asdict
+
+    pytest.importorskip("torchvision")
+    from torchtitan.experiments.graph_trainer.muse_glimmer.config_registry import (
+        graph_trainer_muse_glimmer_30b_sdpa_c4_4x2,
+        graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2,
+    )
+
+    manual_compile = asdict(graph_trainer_muse_glimmer_30b_sdpa_c4_4x2().compile)
+    autoparallel_compile = asdict(
+        graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2().compile
+    )
+    assert {
+        name: (manual_compile[name], autoparallel_compile[name])
+        for name in manual_compile
+        if manual_compile[name] != autoparallel_compile[name]
+    } == {"enable_autoparallel": (False, True)}
+    assert manual_compile["memory_policy"] == "eager"
+    assert manual_compile["inductor_compilation"] == "full"
+    assert manual_compile["disable_passes"] == ["cudagraph_pass"]
+    assert manual_compile["autoparallel_solver"] == "approx"
+
+
 def test_llama_cp_rejects_simultaneous_dp_replicate_and_dp_shard_axes():
     from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
 
@@ -1011,6 +1265,7 @@ def test_autoparallel_graph_preserves_traced_kwargs_at_runtime():
 
     autop = object.__new__(autoparallel_api.AutoParallelGraph)
     autop.model = torch.nn.Module()
+    autop.mesh = object()
     autop.gm = SimpleNamespace(graph=object())
     autop.joint_with_descriptors = SimpleNamespace(
         params_spec=[],
@@ -1046,6 +1301,7 @@ def test_autoparallel_graph_preserves_traced_kwargs_at_runtime():
         )
 
     assert output is tokens
+    assert model._graph_trainer_autoparallel_mesh is autop.mesh
     assert calls == [
         (
             (tokens,),

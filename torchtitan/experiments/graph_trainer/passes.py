@@ -144,6 +144,7 @@ def compile_time_passes(
     *,
     use_cudagraph: bool = False,
     parallel_dims=None,
+    autoparallel_mesh=None,
     include_inductor: bool = True,
     include_mandatory_normalization: bool = True,
 ) -> list[Callable]:
@@ -350,26 +351,15 @@ def compile_time_passes(
         config.compile.enable_autoparallel
         and config.compile.inductor_compilation == "full"
     ):
-        if parallel_dims is None:
+        if autoparallel_mesh is None:
             raise ValueError(
-                "AutoParallel full Inductor compilation requires ParallelDims"
+                "AutoParallel full Inductor compilation requires its runtime mesh"
             )
-        ep_mesh = parallel_dims.get_optional_mesh("ep")
-        if ep_mesh is not None:
-            mesh_axes = ["efsdp", "ep"]
-        else:
-            mesh_axes = [
-                name
-                for name in ("dp_replicate", "fsdp", "tp")
-                if parallel_dims.get_optional_mesh(name) is not None
-            ]
         from torchtitan.experiments.graph_trainer.autoparallel_api import (
             _autoparallel_inductor_configs,
         )
 
-        full_inductor_configs = _autoparallel_inductor_configs(
-            parallel_dims.get_mesh(mesh_axes)
-        )
+        full_inductor_configs = _autoparallel_inductor_configs(autoparallel_mesh)
 
     passes.extend(
         final_inductor_compile_passes(
@@ -446,6 +436,7 @@ def construct_default_graph_passes(
     config: "GraphTrainer.Config",
     *,
     parallel_dims=None,
+    autoparallel_mesh=None,
 ) -> list[Callable]:
     """Build the pass list for the aot_fx_trace path.
 
@@ -467,6 +458,7 @@ def construct_default_graph_passes(
                 config,
                 use_cudagraph=want_cudagraph,
                 parallel_dims=parallel_dims,
+                autoparallel_mesh=autoparallel_mesh,
             )
         )
 

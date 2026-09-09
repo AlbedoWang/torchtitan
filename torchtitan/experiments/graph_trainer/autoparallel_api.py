@@ -238,6 +238,7 @@ class AutoParallelGraph(AutoParallel):
             sharded_buffer_dict,
             forward_fn=forward,
         )
+        parallel_model._graph_trainer_autoparallel_mesh = self.mesh
         setattr(
             parallel_model,
             _MANAGES_CONTEXT_PARALLEL_INPUT_ATTR,

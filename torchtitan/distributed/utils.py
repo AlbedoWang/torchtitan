@@ -92,6 +92,17 @@ def _dist_reduce(
             Defaults to None. If provided, this all_reduce will be called for the extra
             process group, and then the result will be all_reduced for the mesh.
     """
+    return float(_dist_reduce_tensor(x, reduceOp, mesh, extra_pg).item())
+
+
+def _dist_reduce_tensor(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh: DeviceMesh | None,
+    extra_pg: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Perform a distributed reduction without moving the result to the CPU."""
+    needs_wait = False
     if isinstance(x, DTensor):
         # loss being a DTensor can be 1) full dtensor or 2) non-full dtensor but
         # TP is enabled. For the former one, a single `full_tensor()` call is enough
@@ -113,10 +124,11 @@ def _dist_reduce(
     # Plain tensor path.
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
-    if mesh is None:
-        return float(x.item())
-    assert x.numel() == 1  # required by `.item()`
-    return float(funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item())
+        needs_wait = True
+    if mesh is not None:
+        x = funcol.all_reduce(x, reduceOp=reduceOp, group=mesh)
+        needs_wait = True
+    return funcol.wait_tensor(x) if needs_wait else x
 
 
 # TODO: rename this to maybe_dist_max
@@ -136,6 +148,17 @@ def dist_sum(
     extra_pg: dist.ProcessGroup | None = None,
 ) -> float:
     return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_sum_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Sum a tensor across process groups and keep the result on its device."""
+    return _dist_reduce_tensor(
         x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
     )
 
@@ -546,7 +569,7 @@ def set_pg_timeouts(
     parallel_dims: ParallelDims,
 ):
     """
-    Sets the timeout for all PGs in the provided mesh, and the default (world) group.
+    Sets the timeout for all PGs in the provided meshes, and the default (world) group.
 
     Note: synchronizes via a barrier, before changing the timeouts. This is important, because
     otherwise you may face a race where the slow rank has not reached the timeout reduction point
@@ -563,12 +586,21 @@ def set_pg_timeouts(
     torch.distributed.barrier(device_ids=[device_module.current_device()])
     device_module.synchronize()
 
-    # None represents the 'default' PG, not part of the mesh
+    # None represents the 'default' PG, not part of the meshes.
     groups: list[torch.distributed.ProcessGroup | None] = [
         mesh.get_group()
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
-    ] + [None]
+    ]
+    for mesh in parallel_dims.spmd_meshes():
+        groups.extend(mesh.get_all_groups())
+    groups.append(None)
+
+    unique_groups: list[torch.distributed.ProcessGroup | None] = []
     for group in groups:
+        if not any(group is existing_group for existing_group in unique_groups):
+            unique_groups.append(group)
+
+    for group in unique_groups:
         torch.distributed.set_timeout(timeout, group)
 
 
