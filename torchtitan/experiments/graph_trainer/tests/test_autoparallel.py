@@ -1043,12 +1043,14 @@ def test_muse_glimmer_paired_configs_only_change_autoparallel():
     from torchtitan.experiments.graph_trainer.muse_glimmer.config_registry import (
         graph_trainer_muse_glimmer_30b_sdpa_c4_4x2,
         graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2,
+        muse_glimmer_30b_sdpa_c4_torchtitan_4x2,
     )
 
-    manual_compile = asdict(graph_trainer_muse_glimmer_30b_sdpa_c4_4x2().compile)
-    autoparallel_compile = asdict(
-        graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2().compile
-    )
+    main_config = muse_glimmer_30b_sdpa_c4_torchtitan_4x2()
+    manual_config = graph_trainer_muse_glimmer_30b_sdpa_c4_4x2()
+    autoparallel_config = graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2()
+    manual_compile = asdict(manual_config.compile)
+    autoparallel_compile = asdict(autoparallel_config.compile)
     assert {
         name: (manual_compile[name], autoparallel_compile[name])
         for name in manual_compile
@@ -1058,6 +1060,9 @@ def test_muse_glimmer_paired_configs_only_change_autoparallel():
     assert manual_compile["inductor_compilation"] == "full"
     assert manual_compile["disable_passes"] == ["cudagraph_pass"]
     assert manual_compile["autoparallel_solver"] == "approx"
+    assert main_config.profiler.trace_post_processor is None
+    assert manual_config.profiler.trace_post_processor is None
+    assert autoparallel_config.profiler.trace_post_processor is None
 
 
 def test_llama_cp_rejects_simultaneous_dp_replicate_and_dp_shard_axes():

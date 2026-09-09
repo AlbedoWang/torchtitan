@@ -158,6 +158,7 @@ def graph_trainer_muse_glimmer_30b_sdpa_c4_4x2() -> (
 ):
     base = _muse_glimmer_30b_sdpa_c4_base()
     config = to_graph_trainer_config(base, model_registry)
+    config.profiler = replace(config.profiler, trace_post_processor=None)
     config.compile = _muse_glimmer_graph_trainer_compile_config(
         enable_autoparallel=False
     )
@@ -169,6 +170,7 @@ def graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2() -> (
 ):
     base = _muse_glimmer_30b_sdpa_c4_base()
     config = to_graph_trainer_config(base, model_registry)
+    config.profiler = replace(config.profiler, trace_post_processor=None)
     config.compile = _muse_glimmer_graph_trainer_compile_config(
         enable_autoparallel=True
     )
