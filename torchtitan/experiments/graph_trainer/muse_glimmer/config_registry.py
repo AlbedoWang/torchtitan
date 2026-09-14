@@ -6,7 +6,7 @@
 
 from dataclasses import fields, replace
 
-from datasets import Features, Value, load_dataset
+from datasets import Features, load_dataset, Value
 from huggingface_hub import hf_hub_download
 
 from torchtitan.components.loss import CrossEntropyLoss
@@ -21,9 +21,7 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.models.muse_glimmer import (
-    model_registry as muse_glimmer_model_registry,
-)
+from torchtitan.models.muse_glimmer import model_registry as muse_glimmer_model_registry
 from torchtitan.models.muse_glimmer.config_registry import (
     muse_glimmer_30b,
     muse_glimmer_debugmodel,
@@ -141,13 +139,9 @@ def graph_trainer_muse_glimmer_30b_sdpa_c4_4x2() -> (
 ):
     base = _muse_glimmer_30b_sdpa_c4_base()
     config = to_graph_trainer_config(base, model_registry)
-    validated_ap_compile = GraphTrainerCompileConfig(
+    config.compile = GraphTrainerCompileConfig(
         enable=True,
-        enable_autoparallel=True,
-    )
-    config.compile = replace(
-        validated_ap_compile,
-        enable_autoparallel=False,
+        memory_policy="eager",
     )
     return _copy_config(config, GraphTrainerMuseGlimmerPackedSDPATrainer.Config)
 

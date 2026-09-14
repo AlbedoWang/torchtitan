@@ -32,19 +32,31 @@ class _FakeMesh:
 
 
 class _FakeParallelDims:
-    dp_replicate_enabled = False
-    cp_enabled = False
     pp_enabled = False
-    tp_enabled = True
-    dp_replicate = 1
-    dp_shard = 2
 
-    def __init__(self, *, sparse: bool = False):
+    def __init__(
+        self,
+        *,
+        sparse: bool = False,
+        generic_3d: bool = False,
+        dp_shard_3d: bool = False,
+    ):
         self.sparse = sparse
+        self.generic_3d = generic_3d
+        self.dp_shard_3d = dp_shard_3d
         self.tp_enabled = not sparse
+        self.dp_replicate_enabled = generic_3d
+        self.cp_enabled = generic_3d or dp_shard_3d
+        self.dp_replicate = 2 if generic_3d else 1
+        self.dp_shard = 1 if generic_3d else 2
+        self.cp = 2 if self.cp_enabled else 1
+        self.tp = 2 if self.tp_enabled else 1
+        self.world_size = self.dp_replicate * self.dp_shard * self.cp * self.tp
 
     def get_optional_mesh(self, name):
-        enabled = {"fsdp", "tp"} if not self.sparse else {"efsdp", "ep"}
+        enabled = {"dp_replicate", "fsdp", "tp"} if self.generic_3d else {"fsdp", "tp"}
+        if self.sparse:
+            enabled = {"efsdp", "ep"}
         return _FakeMesh((name,)) if name in enabled else None
 
     def get_mesh(self, names):
@@ -59,8 +71,14 @@ class _FakeAutoParallelGraph:
     def __init__(self, model, input_fn, mesh, **kwargs):
         self.model = model
         self.input_fn = input_fn
+        self.mesh = mesh
         self.kwargs = kwargs
         self.used_fx_path = False
+        self.optimize_calls = 0
+        self.sharding_optimizer = SimpleNamespace(
+            load_placements=self._load_placements,
+            save_placements=self._save_placements,
+        )
         _FakeAutoParallelGraph.instances.append(self)
 
     def __enter__(self):
@@ -76,10 +94,18 @@ class _FakeAutoParallelGraph:
         self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
-        pass
+        self.output_constraints = constraints
 
     def optimize_placement(self, verbose=False):
+        self.optimize_calls += 1
         return object()
+
+    def _load_placements(self, path):
+        self.loaded_path = path
+        return object()
+
+    def _save_placements(self, path):
+        self.saved_path = path
 
     def apply_placement_for_fx_module(self, *args, **kwargs):
         self.used_fx_path = True
@@ -189,6 +215,28 @@ def test_autoparallel_config_validation_and_defaults():
     assert custom_compile_config.enable_fsdp_ag_rs_overlap
     assert custom_compile_config.enable_fsdp_dense_region_overlap
     assert custom_compile_config.disable_passes == []
+
+    with pytest.raises(ValueError, match="save and load paths are mutually exclusive"):
+        GraphTrainerCompileConfig(
+            enable_autoparallel=True,
+            autoparallel_placements_save_path="save.json",
+            autoparallel_placements_load_path="load.json",
+        )
+    with pytest.raises(ValueError, match="require --compile.enable_autoparallel"):
+        GraphTrainerCompileConfig(autoparallel_placements_load_path="load.json")
+
+
+def test_muse_manual_uses_graphtrainer_defaults_with_eager_memory_policy():
+    pytest.importorskip("torchvision")
+    from torchtitan.experiments.graph_trainer.muse_glimmer.config_registry import (
+        graph_trainer_muse_glimmer_30b_sdpa_c4_4x2,
+    )
+
+    config = graph_trainer_muse_glimmer_30b_sdpa_c4_4x2()
+    assert config.compile.enable_autoparallel is False
+    assert config.compile.memory_policy == "eager"
+    assert config.compile.inductor_compilation == "regional"
+    assert config.compile.disable_passes == []
 
 
 @pytest.mark.parametrize(
@@ -459,18 +507,16 @@ def test_autoparallel_deepseek_rope_uses_runtime_positions():
     torch.testing.assert_close(actual, expected)
 
 
-def test_autoparallel_deepseek_rejects_flex_attention():
+def test_autoparallel_deepseek_accepts_flex_attention():
     pytest.importorskip("autoparallel")
     from autoparallel._testing.models.dsv3 import DeepSeekV3Model
 
     from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry
 
     config = model_registry("debugmodel", attn_backend="flex").model
-    with torch.device("meta"), pytest.raises(
-        ValueError,
-        match="does not support FlexAttention",
-    ):
-        DeepSeekV3Model(config, mesh=None, compute_dtype=torch.bfloat16)
+    with torch.device("meta"):
+        model = DeepSeekV3Model(config, mesh=None, compute_dtype=torch.bfloat16)
+    assert len(model.layers) == len(config.layers)
 
 
 @pytest.mark.parametrize(
@@ -562,3 +608,214 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert len(autop.input_constraints) == 2
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path
+
+
+@pytest.mark.parametrize("use_saved_placements", [False, True])
+def test_llama_dp_shard_cp_tp_autoparallel_contract(tmp_path, use_saved_placements):
+    from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
+
+    _FakeAutoParallelGraph.instances.clear()
+    ap_mesh = _FakeMesh(("dp_shard", "cp", "tp"), size=8)
+    placement_path = tmp_path / "placements.json"
+    compile_config = GraphTrainerCompileConfig(
+        enable_autoparallel=True,
+        autoparallel_solver="approx",
+        autoparallel_placements_load_path=(
+            str(placement_path) if use_saved_placements else ""
+        ),
+        autoparallel_placements_save_path=(
+            "" if use_saved_placements else str(placement_path)
+        ),
+    )
+    model = SimpleNamespace(config=SimpleNamespace(vocab_size=16))
+
+    with (
+        patch.object(
+            parallelize_autoparallel,
+            "init_device_mesh",
+            return_value=ap_mesh,
+        ) as mesh_builder,
+        patch.object(
+            parallelize_autoparallel,
+            "AutoParallelGraph",
+            _FakeAutoParallelGraph,
+        ),
+        patch.object(
+            parallelize_autoparallel,
+            "apply_compile",
+            lambda model, **_: model,
+        ),
+        patch.object(
+            parallelize_autoparallel,
+            "_apply_autoparallel_context_parallel_attention",
+        ) as apply_cp,
+        patch.object(parallelize_autoparallel, "device_type", "cpu"),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_llama(
+            model,
+            parallel_dims=_FakeParallelDims(dp_shard_3d=True),
+            training=_training_config(),
+            parallelism=ParallelismConfig(),
+            compile_config=compile_config,
+            ac_config=object(),
+            dump_folder="",
+        )
+
+    mesh_builder.assert_called_once_with(
+        "cpu",
+        (2, 2, 2),
+        mesh_dim_names=("dp_shard", "cp", "tp"),
+    )
+    autop = _FakeAutoParallelGraph.instances[0]
+    input_sharding = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Shard(1),
+        torch.distributed.tensor.Replicate(),
+    )
+    output_sharding = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Shard(1),
+        torch.distributed.tensor.Shard(2),
+    )
+    assert autop.mesh is ap_mesh
+    assert autop.kwargs["solver"] == "approx"
+    assert autop.kwargs["strategy_radius"] == (0 if use_saved_placements else 2)
+    assert autop.input_constraints == [input_sharding, input_sharding]
+    assert autop.output_constraints == [output_sharding]
+    model_output = autop.apply_kwargs["model_output"]
+    assert model_output.output_placements == (torch.distributed.tensor.Shard(2),)
+    assert model_output.sharded_output_axis == 2
+    assert autop.apply_kwargs["manages_context_parallel_input"] is False
+    apply_cp.assert_called_once_with(model, ap_mesh)
+    if use_saved_placements:
+        assert autop.optimize_calls == 0
+        assert autop.loaded_path == str(placement_path)
+    else:
+        assert autop.optimize_calls == 1
+        assert autop.saved_path == placement_path
+
+
+def test_llama_cp_rejects_simultaneous_dp_replicate_and_dp_shard_axes():
+    from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
+
+    parallel_dims = _FakeParallelDims(generic_3d=True)
+    parallel_dims.dp_shard = 2
+    with pytest.raises(
+        ValueError,
+        match="simultaneous dp_replicate and dp_shard axes",
+    ):
+        parallelize_autoparallel._build_autoparallel_mesh(parallel_dims)
+
+
+def test_llama_autoparallel_context_parallel_wraps_sdpa():
+    from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
+    from torchtitan.models.common.attention import ScaledDotProductAttention
+
+    inner_attention = ScaledDotProductAttention(ScaledDotProductAttention.Config())
+    attention = SimpleNamespace(
+        inner_attention=inner_attention,
+        scaling=None,
+        enable_gqa=True,
+    )
+    model = SimpleNamespace(layers={"0": SimpleNamespace(attention=attention)})
+    mesh = object()
+    calls = []
+
+    def fake_make_context_parallel(actual_mesh, **kwargs):
+        assert actual_mesh is mesh
+        assert kwargs == {
+            "kind": "sdpa",
+            "is_causal": True,
+            "scale": None,
+            "enable_gqa": True,
+        }
+
+        def cp_attention(q, k, v):
+            calls.append((q.shape, k.shape, v.shape))
+            return q
+
+        return cp_attention
+
+    with patch.object(
+        parallelize_autoparallel,
+        "make_context_parallel",
+        side_effect=fake_make_context_parallel,
+    ):
+        parallelize_autoparallel._apply_autoparallel_context_parallel_attention(
+            model, mesh
+        )
+
+    q = torch.randn(2, 8, 4, 16)
+    k = torch.randn(2, 8, 2, 16)
+    v = torch.randn(2, 8, 2, 16)
+    actual = inner_attention(
+        q,
+        k,
+        v,
+        attention_masks=None,
+        scale=None,
+        enable_gqa=True,
+    )
+    torch.testing.assert_close(actual, q)
+    assert calls == [
+        (
+            torch.Size((2, 4, 8, 16)),
+            torch.Size((2, 2, 8, 16)),
+            torch.Size((2, 2, 8, 16)),
+        )
+    ]
+
+
+def test_llama_autoparallel_context_parallel_rejects_non_sdpa():
+    from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
+
+    model = SimpleNamespace(
+        layers={
+            "0": SimpleNamespace(
+                attention=SimpleNamespace(inner_attention=torch.nn.Identity())
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="currently requires SDPA"):
+        parallelize_autoparallel._apply_autoparallel_context_parallel_attention(
+            model, object()
+        )
+
+
+def test_autoparallel_cp_input_contract_defaults_to_model_managed():
+    from torchtitan.experiments.graph_trainer.autoparallel_api import (
+        autoparallel_manages_context_parallel_input,
+    )
+
+    model = torch.nn.Module()
+    assert autoparallel_manages_context_parallel_input(model) is True
+    model._torchtitan_autoparallel_manages_context_parallel_input = False
+    assert autoparallel_manages_context_parallel_input(model) is False
+
+
+@pytest.mark.parametrize(
+    ("model_manages_cp", "expected_input_enabled", "expected_mesh_name"),
+    [(True, False, "batch"), (False, True, "loss")],
+)
+def test_graph_trainer_respects_autoparallel_cp_input_contract(
+    model_manages_cp, expected_input_enabled, expected_mesh_name
+):
+    from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+
+    batch_mesh = object()
+    loss_mesh = object()
+    model = torch.nn.Module()
+    model._torchtitan_autoparallel_manages_context_parallel_input = model_manages_cp
+    trainer = object.__new__(GraphTrainer)
+    trainer.config = SimpleNamespace(
+        compile=GraphTrainerCompileConfig(enable_autoparallel=True)
+    )
+    trainer.model_parts = [model]
+    trainer.parallel_dims = SimpleNamespace(
+        cp_enabled=True,
+        get_optional_mesh=lambda name: {"batch": batch_mesh, "loss": loss_mesh}[name],
+    )
+
+    assert trainer._context_parallel_input_enabled() is expected_input_enabled
+    expected_mesh = batch_mesh if expected_mesh_name == "batch" else loss_mesh
+    assert trainer._metrics_loss_mesh() is expected_mesh

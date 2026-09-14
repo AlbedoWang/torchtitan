@@ -30,6 +30,11 @@ from torchtitan.experiments.graph_trainer.common_utils import annotate_module_fq
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
 
+_MANAGES_CONTEXT_PARALLEL_INPUT_ATTR = (
+    "_torchtitan_autoparallel_manages_context_parallel_input"
+)
+
+
 @dataclass(frozen=True)
 class AutoParallelModelOutput:
     output_mesh: DeviceMesh
@@ -110,6 +115,11 @@ def _wrap_autoparallel_output(
     )
 
 
+def autoparallel_manages_context_parallel_input(model: nn.Module) -> bool:
+    """Return whether an AutoParallel model owns CP input preprocessing."""
+    return bool(getattr(model, _MANAGES_CONTEXT_PARALLEL_INPUT_ATTR, True))
+
+
 class AutoParallelGraph(AutoParallel):
     """AutoParallel variant for graph_trainer's ``aot_fx_trace`` pipeline."""
 
@@ -123,6 +133,7 @@ class AutoParallelGraph(AutoParallel):
         *,
         compile_config: GraphTrainerCompileConfig,
         model_output: AutoParallelModelOutput | None = None,
+        manages_context_parallel_input: bool = True,
     ) -> nn.Module:
         """Return an AOT-backed parallel module for graph_trainer tracing.
 
@@ -182,9 +193,15 @@ class AutoParallelGraph(AutoParallel):
             del params
             return _wrap_autoparallel_output(output, model_output)
 
-        return make_parallel_module(
+        parallel_model = make_parallel_module(
             self.model,
             sharded_param_dict,
             sharded_buffer_dict,
             forward_fn=forward,
         )
+        setattr(
+            parallel_model,
+            _MANAGES_CONTEXT_PARALLEL_INPUT_ATTR,
+            manages_context_parallel_input,
+        )
+        return parallel_model
