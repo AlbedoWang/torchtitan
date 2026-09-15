@@ -131,7 +131,7 @@ def parallelize_autoparallel_muse_glimmer(
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
         repeated_subgraphs=True,
-        solver="approx",
+        solver=compile_config.autoparallel_solver,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints([input_sharding] * (2 + 1 + len(window_sizes)))

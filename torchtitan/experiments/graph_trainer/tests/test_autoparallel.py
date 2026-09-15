@@ -52,6 +52,7 @@ class _FakeParallelDims:
         self.dp_shard = 1 if generic_3d else 2
         self.cp = 2 if self.cp_enabled else 1
         self.tp = 2 if self.tp_enabled else 1
+        self.ep = 2 if sparse else 1
         self.world_size = self.dp_replicate * self.dp_shard * self.cp * self.tp
 
     def get_optional_mesh(self, name):
@@ -771,7 +772,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     expected_reshard_after_forward,
 ):
     class FakeDeepSeekV3Model(torch.nn.Module):
-        def __init__(self, config, *, mesh, compute_dtype):
+        def __init__(self, config, *, mesh, roles, compute_dtype):
             super().__init__()
             self.model_args = SimpleNamespace(vocab_size=16)
 
@@ -804,7 +805,14 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
             patch.object(
                 parallelize_autoparallel,
                 "_load_autoparallel_dsv3_dependency",
-                return_value=(FakeDeepSeekV3Model, lambda model: None),
+                return_value=(
+                    FakeDeepSeekV3Model,
+                    lambda model: None,
+                    lambda **kwargs: (
+                        _FakeMesh(("dp_shard_in_ep",)),
+                        object(),
+                    ),
+                ),
             ),
         )
 
@@ -838,9 +846,153 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     assert mp_policy.reduce_dtype is torch.float32
     assert autop.kwargs["reshard_after_forward"] is expected_reshard_after_forward
     assert autop.kwargs.get("dynamic", False) is (model_name == "deepseek")
+    assert autop.kwargs["solver"] == compile_config.autoparallel_solver
     assert len(autop.input_constraints) == 2
     assert autop.apply_kwargs["compile_config"] is compile_config
     assert autop.used_fx_path
+
+
+@pytest.mark.parametrize(
+    "ap_mesh_shape",
+    [
+        (2, 2, 4),
+        (2, 2, 8),
+        (4, 2, 8),
+    ],
+)
+def test_deepseek_folded_ep_tp_autoparallel_contract(ap_mesh_shape):
+    from torchtitan.experiments.graph_trainer.deepseek_v3 import (
+        parallelize_autoparallel,
+    )
+
+    class FakeDeepSeekV3Model(torch.nn.Module):
+        def __init__(self, config, *, mesh, roles, compute_dtype):
+            super().__init__()
+            self.model_args = SimpleNamespace(vocab_size=16)
+            self.mesh = mesh
+            self.roles = roles
+
+    dp_shard_mod_ep, dp_shard_in_ep, tp = ap_mesh_shape
+    dp_shard = dp_shard_mod_ep * dp_shard_in_ep
+    ep = dp_shard_in_ep * tp
+    mesh_axis_names = ("dp_shard_mod_ep", "dp_shard_in_ep", "tp")
+    ap_mesh = _FakeMesh(mesh_axis_names, size=dp_shard * tp)
+    moe_roles = object()
+    mesh_builder_calls = []
+
+    def build_moe_mesh(**kwargs):
+        mesh_builder_calls.append(kwargs)
+        return ap_mesh, moe_roles
+
+    parallel_dims = SimpleNamespace(
+        dp_replicate_enabled=False,
+        cp_enabled=False,
+        pp_enabled=False,
+        dp_replicate=1,
+        dp_shard=dp_shard,
+        cp=1,
+        tp=tp,
+        ep=ep,
+    )
+    compile_config = GraphTrainerCompileConfig(
+        enable_autoparallel=True,
+        autoparallel_solver="approx",
+    )
+    _FakeAutoParallelGraph.instances.clear()
+
+    with (
+        patch.object(
+            parallelize_autoparallel,
+            "_load_autoparallel_dsv3_dependency",
+            return_value=(
+                FakeDeepSeekV3Model,
+                lambda model: None,
+                build_moe_mesh,
+            ),
+        ),
+        patch.object(
+            parallelize_autoparallel,
+            "AutoParallelGraph",
+            _FakeAutoParallelGraph,
+        ),
+        patch.object(
+            parallelize_autoparallel,
+            "apply_compile",
+            lambda model, **_: model,
+        ),
+        patch.object(parallelize_autoparallel, "device_type", "cpu"),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_deepseekv3(
+            SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
+            parallel_dims=parallel_dims,
+            training=_training_config(),
+            parallelism=ParallelismConfig(),
+            compile_config=compile_config,
+            ac_config=object(),
+            dump_folder="",
+        )
+
+    assert mesh_builder_calls == [
+        {
+            "dp_replicate": 1,
+            "dp_shard": dp_shard,
+            "cp": 1,
+            "tp": tp,
+            "ep": ep,
+            "device_type": "cpu",
+        }
+    ]
+    autop = _FakeAutoParallelGraph.instances[0]
+    expected_sharding = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Replicate(),
+    )
+    assert autop.mesh is ap_mesh
+    assert autop.model.mesh is ap_mesh
+    assert autop.model.roles is moe_roles
+    assert autop.kwargs["solver"] == "approx"
+    assert autop.input_constraints == [expected_sharding, expected_sharding]
+    assert autop.output_constraints == [expected_sharding]
+
+
+def test_muse_autoparallel_uses_configured_solver():
+    from torchtitan.experiments.graph_trainer.muse_glimmer import (
+        parallelize_autoparallel,
+    )
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=16, layers=[]),
+    )
+    compile_config = GraphTrainerCompileConfig(
+        enable_autoparallel=True,
+        autoparallel_solver="lp",
+    )
+    _FakeAutoParallelGraph.instances.clear()
+
+    with (
+        patch.object(
+            parallelize_autoparallel,
+            "AutoParallelGraph",
+            _FakeAutoParallelGraph,
+        ),
+        patch.object(
+            parallelize_autoparallel,
+            "apply_compile",
+            lambda model, **_: model,
+        ),
+    ):
+        parallelize_autoparallel.parallelize_autoparallel_muse_glimmer(
+            model,
+            parallel_dims=_FakeParallelDims(),
+            training=_training_config(),
+            parallelism=ParallelismConfig(),
+            compile_config=compile_config,
+            ac_config=object(),
+            dump_folder="",
+        )
+
+    assert _FakeAutoParallelGraph.instances[0].kwargs["solver"] == "lp"
 
 
 @pytest.mark.parametrize("use_saved_placements", [False, True])

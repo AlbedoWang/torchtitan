@@ -10,7 +10,8 @@ AutoParallel-based parallelization for DeepSeek V3.
 Uses AutoParallelGraph to apply solver-based SPMD sharding on AutoParallel's
 local_map DSv3 model (whose ops the solver supports), then lets graph_trainer
 trace and compile the placed model through its normal `aot_fx_trace` train-step
-pipeline. Requires a 2D sparse mesh (EFSDP+EP).
+pipeline. AutoParallel's aligned MoE mesh keeps the axes that form EP explicit
+so `local_map` can flatten them into one EP group.
 
 The torchtitan DSv3 model is replaced with AutoParallel's DeepSeekV3Model
 because the solver doesn't support torchtitan's token_dispatcher ops
@@ -23,7 +24,7 @@ import time
 import torch
 from autoparallel import ForwardInputs
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -42,6 +43,7 @@ from torchtitan.tools.utils import device_type
 def _load_autoparallel_dsv3_dependency():
     """Load the temporary AutoParallel DSv3 integration dependency."""
     try:
+        from autoparallel import build_moe_mesh
         from autoparallel._testing.models.dsv3 import (
             annotate_deepseekv3_for_graph_trainer,
             DeepSeekV3Model,
@@ -53,7 +55,7 @@ def _load_autoparallel_dsv3_dependency():
             "helper into a supported AutoParallel namespace before treating this "
             "route as a stable production dependency."
         ) from exc
-    return DeepSeekV3Model, annotate_deepseekv3_for_graph_trainer
+    return DeepSeekV3Model, annotate_deepseekv3_for_graph_trainer, build_moe_mesh
 
 
 def _set_torchtitan_fields(parallel_model):
@@ -102,7 +104,8 @@ def parallelize_autoparallel_deepseekv3(
     """Apply AutoParallelGraph SPMD sharding to DeepSeek V3.
 
     Returns a sharded model carrying AutoParallel train-step metadata.
-    Requires a 2D sparse mesh (EFSDP+EP).
+    The TorchTitan batch boundary shards over DP axes only. TP is a regular
+    AutoParallel axis, while TorchTitan context parallelism remains unsupported.
     """
     validate_autoparallel_config(compile_config)
 
@@ -112,27 +115,6 @@ def parallelize_autoparallel_deepseekv3(
         raise ValueError("AutoParallel DeepSeek V3 does not support CP yet")
     if parallel_dims.pp_enabled:
         raise ValueError("AutoParallel DeepSeek V3 does not support PP yet")
-    if parallel_dims.tp_enabled:
-        raise ValueError("AutoParallel DeepSeek V3 does not support TP yet")
-
-    required_sparse_axes = ("efsdp", "ep")
-    missing_sparse_axes = [
-        name
-        for name in required_sparse_axes
-        if parallel_dims.get_optional_mesh(name) is None
-    ]
-    if missing_sparse_axes:
-        raise ValueError(
-            "AutoParallel DeepSeek V3 requires EFSDP and EP axes, but missing "
-            f"{missing_sparse_axes}"
-        )
-
-    sparse_mesh = parallel_dims.get_mesh(list(required_sparse_axes))
-    if sparse_mesh.ndim != 2 or sparse_mesh.mesh_dim_names != required_sparse_axes:
-        raise ValueError(
-            "AutoParallel DeepSeek V3 requires a 2D sparse mesh with EFSDP and EP "
-            f"axes, but got mesh axes {sparse_mesh.mesh_dim_names}"
-        )
 
     param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
     reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
@@ -148,7 +130,17 @@ def parallelize_autoparallel_deepseekv3(
     (
         APDeepSeekV3Model,
         annotate_deepseekv3_for_graph_trainer,
+        build_moe_mesh,
     ) = _load_autoparallel_dsv3_dependency()
+
+    ap_mesh, moe_roles = build_moe_mesh(
+        dp_replicate=parallel_dims.dp_replicate,
+        dp_shard=parallel_dims.dp_shard,
+        cp=parallel_dims.cp,
+        tp=parallel_dims.tp,
+        ep=parallel_dims.ep,
+        device_type=device_type,
+    )
 
     # Use AutoParallel's DSv3 model: torchtitan's token_dispatcher uses
     # aten::div.Tensor_mode which the AP solver doesn't support yet.
@@ -157,7 +149,8 @@ def parallelize_autoparallel_deepseekv3(
     with torch.device("meta"):
         ap_model = APDeepSeekV3Model(
             model.config,
-            mesh=sparse_mesh,
+            mesh=ap_mesh,
+            roles=moe_roles,
             compute_dtype=param_dtype,
         )
 
@@ -179,15 +172,25 @@ def parallelize_autoparallel_deepseekv3(
         ).repeat(global_batch_size, 1)
         return ForwardInputs(args=(tokens,), kwargs={"positions": positions})
 
-    x_sharding = (Shard(0), Shard(0))
+    data_parallel_axes = {
+        "dp_replicate",
+        "dp_shard_mod_ep",
+        "dp_shard_in_ep",
+    }
+    assert ap_mesh.mesh_dim_names is not None
+    x_sharding = tuple(
+        Shard(0) if name in data_parallel_axes else Replicate()
+        for name in ap_mesh.mesh_dim_names
+    )
 
     autop = AutoParallelGraph(
         ap_model,
         input_fn,
-        sparse_mesh,
+        ap_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
         dynamic=True,
+        solver=compile_config.autoparallel_solver,
     )
 
     annotate_deepseekv3_for_graph_trainer(autop.model)
@@ -202,11 +205,8 @@ def parallelize_autoparallel_deepseekv3(
         t1 = time.time()
         logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
 
-        # The solved output is logically batch-sharded over EFSDP and EP
-        # (Shard(0), Shard(0)). Those axes are data-parallel factors for
-        # loss computation, so graph_trainer can consume each rank's local
-        # logits as a plain tensor and pair them with local labels. Only TP
-        # vocab sharding needs a DTensor output boundary for loss_parallel().
+        # The output is batch-sharded over DP axes and replicated over TP, so
+        # graph_trainer can pair each rank's local logits with local labels.
         parallel_mod = autop.apply_placement_for_fx_module(
             sharding_placement,
             compile_config=compile_config,
