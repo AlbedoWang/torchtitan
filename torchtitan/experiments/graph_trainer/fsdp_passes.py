@@ -150,6 +150,10 @@ def _reorder_overlap_nodes(
         _stable_topological_sort(graph, overlap_deps)
     else:
         _move_overlap_nodes(graph, overlap_deps, bucketed_node_types)
+        # Preserve every legal overlap move while restoring ordering for data
+        # dependencies that a redistribution chain can make incompatible with
+        # a requested prefetch move.
+        _stable_topological_sort(graph, {})
 
 
 def _get_or_create_extra_pg(
@@ -289,6 +293,20 @@ class FSDPParamOrderBucketer(ManualOverlapPreservingBucketer):
         module_fqn = node.meta.get("custom", {}).get(_MODULE_FQN)
         param_idx = self.fsdp_param_module_order.get(module_fqn, len(self.node_idx))
         return (param_idx, self.node_idx[node])
+
+    def _split_independent_collectives(
+        self,
+        coll_nodes: OrderedSet[fx.Node],
+        scope_nodes: list[fx.Node],
+    ) -> list[list[fx.Node]]:
+        # Redistribution nodes can sit outside the FQN bucket while connecting
+        # collectives inside it. Keep membership scoped by FQN, but determine
+        # collective independence over the complete, current graph.
+        del scope_nodes
+        self.node_idx = {node: idx for idx, node in enumerate(self.graph.nodes)}
+        return super()._split_independent_collectives(
+            coll_nodes, list(self.graph.nodes)
+        )
 
     def _bucket_group(self, coll_nodes: list[fx.Node]) -> None:
         if self.fsdp_param_module_order:
