@@ -458,7 +458,7 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
         if getattr(pass_fn, "func", pass_fn) is passes.full_inductor_compilation_pass
     )
     configs = full_pass.keywords["inductor_configs"]
-    assert configs["aten_distributed_optimizations.enable_overlap_scheduling"] is True
+    assert configs["aten_distributed_optimizations.enable_overlap_scheduling"] is False
     assert configs["aten_distributed_optimizations.collective_bucketing"] is True
     assert configs["aten_distributed_optimizations.insert_overlap_deps"] is True
     assert configs["aten_distributed_optimizations.max_compute_pre_fetch"] == 10
