@@ -35,6 +35,7 @@ class AutoParallelModelOutput:
 
 def _autoparallel_inductor_configs(mesh: DeviceMesh) -> dict:
     """Return settings for the no-scheduling shard-order diagnostic."""
+    # Diagnostic only: intentionally omit aten_autobucketing_reordering_pass.
     return {
         "aten_distributed_optimizations.enable_overlap_scheduling": False,
         "aten_distributed_optimizations.collective_bucketing": True,
