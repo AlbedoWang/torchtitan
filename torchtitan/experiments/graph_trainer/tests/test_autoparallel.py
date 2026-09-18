@@ -888,11 +888,13 @@ def test_deepseek_folded_ep_tp_autoparallel_contract(ap_mesh_shape):
         dp_replicate_enabled=False,
         cp_enabled=False,
         pp_enabled=False,
+        tp_enabled=tp > 1,
         dp_replicate=1,
         dp_shard=dp_shard,
         cp=1,
         tp=tp,
         ep=ep,
+        get_mesh=lambda name: _FakeMesh((name,), size=tp),
     )
     compile_config = GraphTrainerCompileConfig(
         enable_autoparallel=True,
@@ -948,12 +950,21 @@ def test_deepseek_folded_ep_tp_autoparallel_contract(ap_mesh_shape):
         torch.distributed.tensor.Shard(0),
         torch.distributed.tensor.Replicate(),
     )
+    expected_output_sharding = (
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Shard(0),
+        torch.distributed.tensor.Shard(2),
+    )
     assert autop.mesh is ap_mesh
     assert autop.model.mesh is ap_mesh
     assert autop.model.roles is moe_roles
     assert autop.kwargs["solver"] == "approx"
     assert autop.input_constraints == [expected_sharding, expected_sharding]
-    assert autop.output_constraints == [expected_sharding]
+    assert autop.output_constraints == [expected_output_sharding]
+    model_output = autop.apply_kwargs["model_output"]
+    assert model_output.output_mesh.mesh_dim_names == ("tp",)
+    assert model_output.output_placements == (torch.distributed.tensor.Shard(2),)
+    assert model_output.sharded_output_axis == 2
 
 
 def test_muse_autoparallel_uses_configured_solver():

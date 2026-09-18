@@ -30,7 +30,10 @@ from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
-from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
+from torchtitan.experiments.graph_trainer.autoparallel_api import (
+    AutoParallelGraph,
+    AutoParallelModelOutput,
+)
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
@@ -182,6 +185,14 @@ def parallelize_autoparallel_deepseekv3(
         Shard(0) if name in data_parallel_axes else Replicate()
         for name in ap_mesh.mesh_dim_names
     )
+    output_sharding = tuple(
+        Shard(0)
+        if name in data_parallel_axes
+        else Shard(2)
+        if name == "tp"
+        else Replicate()
+        for name in ap_mesh.mesh_dim_names
+    )
 
     autop = AutoParallelGraph(
         ap_model,
@@ -198,18 +209,26 @@ def parallelize_autoparallel_deepseekv3(
     with autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints([x_sharding, x_sharding])
-        autop.add_output_constraints([x_sharding])
+        autop.add_output_constraints([output_sharding])
 
         t0 = time.time()
         sharding_placement = autop.optimize_placement()
         t1 = time.time()
         logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
 
-        # The output is batch-sharded over DP axes and replicated over TP, so
-        # graph_trainer can pair each rank's local logits with local labels.
+        model_output = (
+            AutoParallelModelOutput(
+                output_mesh=parallel_dims.get_mesh("tp"),
+                output_placements=(Shard(2),),
+                sharded_output_axis=2,
+            )
+            if parallel_dims.tp_enabled
+            else None
+        )
         parallel_mod = autop.apply_placement_for_fx_module(
             sharding_placement,
             compile_config=compile_config,
+            model_output=model_output,
         )
 
     _set_torchtitan_fields(parallel_mod)
