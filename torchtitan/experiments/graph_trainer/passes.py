@@ -368,7 +368,8 @@ def compile_time_passes(
         )
 
         full_inductor_configs = _autoparallel_inductor_configs(
-            parallel_dims.get_mesh(mesh_axes)
+            parallel_dims.get_mesh(mesh_axes),
+            synchronize_world_buckets=parallel_dims.cp_enabled,
         )
 
     passes.extend(

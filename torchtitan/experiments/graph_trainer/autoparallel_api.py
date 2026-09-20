@@ -42,7 +42,9 @@ class AutoParallelModelOutput:
     sharded_output_axis: int
 
 
-def _autoparallel_inductor_configs(mesh: DeviceMesh) -> dict:
+def _autoparallel_inductor_configs(
+    mesh: DeviceMesh, *, synchronize_world_buckets: bool = False
+) -> dict:
     """Return the Inductor settings used by AutoParallel's Llama example.
 
     Keep the auto-bucketing state local to this compile instead of mutating
@@ -51,6 +53,7 @@ def _autoparallel_inductor_configs(mesh: DeviceMesh) -> dict:
     """
     set_nccl_topo_config(detect_nccl_topo_config(mesh))
     autobucketing_config = aten_autobucketing_config()
+    aten_autobucketing_config.synchronize_world_buckets = synchronize_world_buckets
     autobucketing_config.custom_runtime_estimation = make_custom_runtime_estimation(
         mesh
     )

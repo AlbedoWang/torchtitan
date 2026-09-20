@@ -469,6 +469,39 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
     assert custom_pass.keywords["configs"].custom_runtime_estimation is not None
 
 
+def test_autoparallel_full_cp_synchronizes_world_buckets():
+    import autoparallel.graph_passes.auto_bucketing as auto_bucketing
+
+    from torchtitan.experiments.graph_trainer import passes
+
+    traced_result = SimpleNamespace(
+        gm=torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph()),
+        state_fqns=[],
+    )
+    config = SimpleNamespace(
+        compile=GraphTrainerCompileConfig(
+            enable_autoparallel=True,
+            enable_async_tensor_parallel=False,
+        ),
+        model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
+        parallelism=SimpleNamespace(
+            fsdp_reshard_after_forward="always",
+            pipeline_parallel_degree=1,
+        ),
+    )
+
+    saved = auto_bucketing.aten_autobucketing_config.synchronize_world_buckets
+    try:
+        passes.construct_default_graph_passes(
+            traced_result,  # pyrefly: ignore [bad-argument-type]
+            config,
+            parallel_dims=_FakeParallelDims(dp_shard_3d=True),
+        )
+        assert auto_bucketing.aten_autobucketing_config.synchronize_world_buckets
+    finally:
+        auto_bucketing.aten_autobucketing_config.synchronize_world_buckets = saved
+
+
 def test_autoparallel_uses_eager_sac_collective_policy():
     from torchtitan.experiments.graph_trainer.memory_policy import (
         tag_with_memory_policy_pass,
