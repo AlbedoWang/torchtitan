@@ -396,16 +396,20 @@ def _find_autoparallel_a2a_linear_save_nodes(
     """
     save_nodes: set[torch.fx.Node] = set()
     num_matches = 0
+    candidates = 0
+    rejections: dict[str, int] = defaultdict(int)
     for a2a in gm.graph.nodes:
         if (
             a2a.op != "call_function"
             or _is_backward_node(a2a)
-            or a2a.target is not torch.ops._dtensor.shard_dim_alltoall.default
+            or a2a.target != torch.ops._dtensor.shard_dim_alltoall.default
         ):
             continue
+        candidates += 1
 
         pre_linear = _follow_forward_view_chain(a2a)
         if pre_linear is None:
+            rejections["pre_linear_chain"] += 1
             continue
         linear_input, linear = pre_linear
         if (
@@ -417,27 +421,37 @@ def _find_autoparallel_a2a_linear_save_nodes(
             )
             or linear.args[0] is not linear_input
         ):
+            rejections["linear"] += 1
             continue
 
         post_linear = _follow_forward_view_chain(linear)
         if post_linear is None:
+            rejections["post_linear_chain"] += 1
             continue
         output, consumer = post_linear
         if (
             output is linear
             or consumer.op != "call_function"
-            or consumer.target is not torch.ops.aten.add.Tensor
+            or consumer.target != torch.ops.aten.add.Tensor
         ):
+            rejections["residual"] += 1
             continue
 
         layer_id = _get_layer_id(a2a)
         if layer_id == _NOT_IN_LAYERS or any(
             _get_layer_id(node) != layer_id for node in (linear, consumer)
         ):
+            rejections["layer"] += 1
             continue
 
         save_nodes.update((a2a, output))
         num_matches += 1
 
-    logger.info("Found %d AutoParallel all-to-all/linear SAC boundaries", num_matches)
+    logger.info(
+        "Found %d AutoParallel all-to-all/linear SAC boundaries "
+        "from %d candidates (rejections=%s)",
+        num_matches,
+        candidates,
+        dict(rejections),
+    )
     return save_nodes
