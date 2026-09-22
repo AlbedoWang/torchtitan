@@ -762,7 +762,7 @@ def test_autoparallel_eager_sac_allows_missing_view_metadata():
     }
 
 
-@pytest.mark.parametrize("node_name", ["a2a", "wo", "post_wo", "residual_add"])
+@pytest.mark.parametrize("node_name", ["a2a", "wo", "residual_add"])
 def test_autoparallel_eager_sac_rejects_cross_layer_boundary(node_name):
     from torchtitan.experiments.graph_trainer.memory_policy import (
         _find_autoparallel_a2a_linear_save_nodes,
@@ -775,7 +775,7 @@ def test_autoparallel_eager_sac_rejects_cross_layer_boundary(node_name):
 
 
 @pytest.mark.parametrize("node_name", ["a2a", "post_wo"])
-def test_autoparallel_eager_sac_rejects_forward_fanout(node_name):
+def test_autoparallel_eager_sac_ignores_nonmatching_forward_fanout(node_name):
     from torchtitan.experiments.graph_trainer.memory_policy import (
         _find_autoparallel_a2a_linear_save_nodes,
     )
@@ -788,7 +788,10 @@ def test_autoparallel_eager_sac_rejects_forward_fanout(node_name):
             args=(getattr(nodes, node_name),),
         )
 
-    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == {
+        nodes.a2a,
+        nodes.post_wo,
+    }
 
 
 def test_autoparallel_eager_sac_requires_residual_add_consumer():
@@ -802,17 +805,17 @@ def test_autoparallel_eager_sac_requires_residual_add_consumer():
     assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
 
 
-def test_autoparallel_eager_sac_requires_post_linear_view_chain():
+def test_autoparallel_eager_sac_allows_direct_residual_consumer():
     from torchtitan.experiments.graph_trainer.memory_policy import (
         _find_autoparallel_a2a_linear_save_nodes,
     )
 
-    gm, _ = _build_autoparallel_a2a_linear_graph(
+    gm, nodes = _build_autoparallel_a2a_linear_graph(
         a2a_fqn="layers.0.attention",
         with_post_linear_views=False,
     )
 
-    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == {nodes.a2a, nodes.wo}
 
 
 @pytest.mark.parametrize("a2a_fqn", ["layers.0.attention.wo", "layers.0.attention"])

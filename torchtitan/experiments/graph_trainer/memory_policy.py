@@ -364,23 +364,30 @@ def tag_with_memory_policy_pass(
     return gm
 
 
-def _follow_forward_view_chain(
+def _find_forward_view_chain_consumers(
     node: torch.fx.Node,
-) -> tuple[torch.fx.Node, torch.fx.Node] | None:
-    """Follow a single-user view chain to its first non-view consumer."""
-    current = node
-    while True:
-        users = [user for user in current.users if not _is_backward_node(user)]
-        if len(users) != 1:
-            return None
-        user = users[0]
-        if not (
-            user.op == "call_function"
-            and isinstance(user.target, torch._ops.OpOverload)
-            and user.target.is_view
-        ):
-            return current, user
-        current = user
+) -> set[tuple[torch.fx.Node, torch.fx.Node]]:
+    """Find non-view consumers reachable through forward-only view paths."""
+    pending = [node]
+    visited: set[torch.fx.Node] = set()
+    consumers: set[tuple[torch.fx.Node, torch.fx.Node]] = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for user in current.users:
+            if _is_backward_node(user):
+                continue
+            if (
+                user.op == "call_function"
+                and isinstance(user.target, torch._ops.OpOverload)
+                and user.target.is_view
+            ):
+                pending.append(user)
+            else:
+                consumers.add((current, user))
+    return consumers
 
 
 def _find_autoparallel_a2a_linear_save_nodes(
@@ -407,35 +414,32 @@ def _find_autoparallel_a2a_linear_save_nodes(
             continue
         candidates += 1
 
-        pre_linear = _follow_forward_view_chain(a2a)
-        if pre_linear is None:
-            rejections["pre_linear_chain"] += 1
-            continue
-        linear_input, linear = pre_linear
-        if (
-            linear.op != "call_function"
-            or linear.target
-            not in (
+        pre_linear = {
+            (linear_input, linear)
+            for linear_input, linear in _find_forward_view_chain_consumers(a2a)
+            if linear.op == "call_function"
+            and linear.target
+            in (
                 torch.ops.aten.mm.default,
                 torch.ops.aten.linear.default,
             )
-            or linear.args[0] is not linear_input
-        ):
+            and linear.args[0] is linear_input
+        }
+        if len(pre_linear) != 1:
             rejections["linear"] += 1
             continue
+        linear_input, linear = next(iter(pre_linear))
 
-        post_linear = _follow_forward_view_chain(linear)
-        if post_linear is None:
-            rejections["post_linear_chain"] += 1
-            continue
-        output, consumer = post_linear
-        if (
-            output is linear
-            or consumer.op != "call_function"
-            or consumer.target != torch.ops.aten.add.Tensor
-        ):
+        post_linear = {
+            (output, consumer)
+            for output, consumer in _find_forward_view_chain_consumers(linear)
+            if consumer.op == "call_function"
+            and consumer.target == torch.ops.aten.add.Tensor
+        }
+        if len(post_linear) != 1:
             rejections["residual"] += 1
             continue
+        output, consumer = next(iter(post_linear))
 
         layer_id = _get_layer_id(a2a)
         if layer_id == _NOT_IN_LAYERS or any(
