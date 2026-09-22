@@ -128,7 +128,9 @@ def _build_autoparallel_a2a_linear_graph(
     *,
     with_backward=False,
     a2a_as_weight=False,
+    a2a_fqn="layers.0.attention.wo",
     linear_op=torch.ops.aten.mm.default,
+    with_post_linear_views=True,
 ):
     """Build the A2A -> WO -> residual shape from the real Llama graph."""
     graph = torch.fx.Graph()
@@ -168,22 +170,31 @@ def _build_autoparallel_a2a_linear_graph(
     )
     wo_args = (x, pre_wo) if a2a_as_weight else (pre_wo, weight)
     wo = graph.call_function(linear_op, args=wo_args)
-    post_wo_unsqueeze = graph.call_function(
-        torch.ops.aten.unsqueeze.default,
-        args=(wo, 0),
-    )
-    post_wo_reshape = graph.call_function(
-        torch.ops.aten.reshape.default,
-        args=(post_wo_unsqueeze, [2, 512, 1, 4096]),
-    )
-    post_wo_permute = graph.call_function(
-        torch.ops.aten.permute.default,
-        args=(post_wo_reshape, [0, 1, 3, 2]),
-    )
-    post_wo = graph.call_function(
-        torch.ops.aten.reshape.default,
-        args=(post_wo_permute, [2, 512, 4096]),
-    )
+    post_wo_nodes = []
+    post_wo = wo
+    if with_post_linear_views:
+        post_wo_unsqueeze = graph.call_function(
+            torch.ops.aten.unsqueeze.default,
+            args=(wo, 0),
+        )
+        post_wo_reshape = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(post_wo_unsqueeze, [2, 512, 1, 4096]),
+        )
+        post_wo_permute = graph.call_function(
+            torch.ops.aten.permute.default,
+            args=(post_wo_reshape, [0, 1, 3, 2]),
+        )
+        post_wo = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(post_wo_permute, [2, 512, 4096]),
+        )
+        post_wo_nodes = [
+            post_wo_unsqueeze,
+            post_wo_reshape,
+            post_wo_permute,
+            post_wo,
+        ]
     residual_add = graph.call_function(
         torch.ops.aten.add.Tensor,
         args=(embedding_output_a2a, post_wo),
@@ -208,21 +219,18 @@ def _build_autoparallel_a2a_linear_graph(
         embedding_a2a: "tok_embeddings",
         embedding_output_a2a: "tok_embeddings",
         qkv: "layers.0.attention.qkv_linear.wqkv",
-        a2a: "layers.0.attention.wo",
+        a2a: a2a_fqn,
         pre_wo_unsqueeze: "layers.0.attention.wo",
         pre_wo_permute: "layers.0.attention.wo",
         pre_wo_reshape: "layers.0.attention.wo",
         pre_wo: "layers.0.attention.wo",
         wo: "layers.0.attention.wo",
-        post_wo_unsqueeze: "layers.0.attention.wo",
-        post_wo_reshape: "layers.0.attention.wo",
-        post_wo_permute: "layers.0.attention.wo",
-        post_wo: "layers.0.attention.wo",
         residual_add: "layers.0",
         ffn_w1: "layers.0.feed_forward.w1",
         ffn_w3: "layers.0.feed_forward.w3",
         ffn_w2: "layers.0.feed_forward.w2",
     }
+    fqns.update({node: "layers.0.attention.wo" for node in post_wo_nodes})
     for node, fqn in fqns.items():
         node.meta["custom"] = {_MODULE_FQN: fqn}
 
@@ -675,12 +683,16 @@ def test_autoparallel_deepseek_accepts_flex_attention():
 @pytest.mark.parametrize(
     "linear_op", [torch.ops.aten.mm.default, torch.ops.aten.linear.default]
 )
-def test_autoparallel_eager_sac_saves_a2a_linear_boundaries(linear_op):
+@pytest.mark.parametrize("a2a_fqn", ["layers.0.attention.wo", "layers.0.attention"])
+def test_autoparallel_eager_sac_saves_a2a_linear_boundaries(linear_op, a2a_fqn):
     from torchtitan.experiments.graph_trainer.memory_policy import (
         tag_with_memory_policy_pass,
     )
 
-    gm, nodes = _build_autoparallel_a2a_linear_graph(linear_op=linear_op)
+    gm, nodes = _build_autoparallel_a2a_linear_graph(
+        linear_op=linear_op,
+        a2a_fqn=a2a_fqn,
+    )
     config = SimpleNamespace(
         compile=SimpleNamespace(enable_autoparallel=True, memory_policy="eager")
     )
@@ -704,12 +716,16 @@ def test_autoparallel_eager_sac_saves_a2a_linear_boundaries(linear_op):
     ]
 
 
-def test_autoparallel_eager_sac_requires_a2a_as_linear_activation():
+@pytest.mark.parametrize("a2a_fqn", ["layers.0.attention.wo", "layers.0.attention"])
+def test_autoparallel_eager_sac_requires_a2a_as_linear_activation(a2a_fqn):
     from torchtitan.experiments.graph_trainer.memory_policy import (
         tag_with_memory_policy_pass,
     )
 
-    gm, nodes = _build_autoparallel_a2a_linear_graph(a2a_as_weight=True)
+    gm, nodes = _build_autoparallel_a2a_linear_graph(
+        a2a_as_weight=True,
+        a2a_fqn=a2a_fqn,
+    )
     config = SimpleNamespace(
         compile=SimpleNamespace(enable_autoparallel=True, memory_policy="eager")
     )
@@ -720,7 +736,73 @@ def test_autoparallel_eager_sac_requires_a2a_as_linear_activation():
     assert nodes.post_wo.meta["recompute"] is CheckpointPolicy.PREFER_RECOMPUTE
 
 
-def test_autoparallel_eager_sac_does_not_rematerialize_a2a_linear():
+@pytest.mark.parametrize("node_name", ["a2a", "wo", "post_wo", "residual_add"])
+def test_autoparallel_eager_sac_rejects_missing_layer_metadata(node_name):
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _find_autoparallel_a2a_linear_save_nodes,
+    )
+
+    gm, nodes = _build_autoparallel_a2a_linear_graph(a2a_fqn="layers.0.attention")
+    getattr(nodes, node_name).meta["custom"].pop(_MODULE_FQN)
+
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+
+
+@pytest.mark.parametrize("node_name", ["a2a", "wo", "post_wo", "residual_add"])
+def test_autoparallel_eager_sac_rejects_cross_layer_boundary(node_name):
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _find_autoparallel_a2a_linear_save_nodes,
+    )
+
+    gm, nodes = _build_autoparallel_a2a_linear_graph(a2a_fqn="layers.0.attention")
+    getattr(nodes, node_name).meta["custom"][_MODULE_FQN] = "layers.1.attention"
+
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+
+
+@pytest.mark.parametrize("node_name", ["a2a", "post_wo"])
+def test_autoparallel_eager_sac_rejects_forward_fanout(node_name):
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _find_autoparallel_a2a_linear_save_nodes,
+    )
+
+    gm, nodes = _build_autoparallel_a2a_linear_graph(a2a_fqn="layers.0.attention")
+    output = next(node for node in gm.graph.nodes if node.op == "output")
+    with gm.graph.inserting_before(output):
+        gm.graph.call_function(
+            torch.ops.aten.alias.default,
+            args=(getattr(nodes, node_name),),
+        )
+
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+
+
+def test_autoparallel_eager_sac_requires_residual_add_consumer():
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _find_autoparallel_a2a_linear_save_nodes,
+    )
+
+    gm, nodes = _build_autoparallel_a2a_linear_graph(a2a_fqn="layers.0.attention")
+    nodes.residual_add.target = torch.ops.aten.mul.Tensor
+
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+
+
+def test_autoparallel_eager_sac_requires_post_linear_view_chain():
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _find_autoparallel_a2a_linear_save_nodes,
+    )
+
+    gm, _ = _build_autoparallel_a2a_linear_graph(
+        a2a_fqn="layers.0.attention",
+        with_post_linear_views=False,
+    )
+
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+
+
+@pytest.mark.parametrize("a2a_fqn", ["layers.0.attention.wo", "layers.0.attention"])
+def test_autoparallel_eager_sac_does_not_rematerialize_a2a_linear(a2a_fqn):
     from torchtitan.experiments.graph_trainer.memory_policy import (
         tag_with_memory_policy_pass,
     )
@@ -729,7 +811,10 @@ def test_autoparallel_eager_sac_does_not_rematerialize_a2a_linear():
     )
 
     def apply_passes(*, enable_autoparallel):
-        gm, nodes = _build_autoparallel_a2a_linear_graph(with_backward=True)
+        gm, nodes = _build_autoparallel_a2a_linear_graph(
+            with_backward=True,
+            a2a_fqn=a2a_fqn,
+        )
         config = SimpleNamespace(
             compile=SimpleNamespace(
                 enable_autoparallel=enable_autoparallel,
@@ -755,7 +840,7 @@ def test_autoparallel_eager_sac_does_not_rematerialize_a2a_linear():
     assert (
         sum(
             node.target is torch.ops._dtensor.shard_dim_alltoall.default
-            and node.meta.get("custom", {}).get(_MODULE_FQN) == "layers.0.attention.wo"
+            and node.meta.get("custom", {}).get(_MODULE_FQN) == a2a_fqn
             for node in regular_gm.graph.nodes
         )
         == 2
@@ -763,7 +848,7 @@ def test_autoparallel_eager_sac_does_not_rematerialize_a2a_linear():
     assert (
         sum(
             node.target is torch.ops._dtensor.shard_dim_alltoall.default
-            and node.meta.get("custom", {}).get(_MODULE_FQN) == "layers.0.attention.wo"
+            and node.meta.get("custom", {}).get(_MODULE_FQN) == a2a_fqn
             for node in autoparallel_gm.graph.nodes
         )
         == 1

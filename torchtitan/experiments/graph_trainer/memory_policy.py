@@ -409,7 +409,8 @@ def _find_autoparallel_a2a_linear_save_nodes(
             continue
         linear_input, linear = pre_linear
         if (
-            linear.target
+            linear.op != "call_function"
+            or linear.target
             not in (
                 torch.ops.aten.mm.default,
                 torch.ops.aten.linear.default,
@@ -422,16 +423,16 @@ def _find_autoparallel_a2a_linear_save_nodes(
         if post_linear is None:
             continue
         output, consumer = post_linear
-        if output is linear or consumer.target is not torch.ops.aten.add.Tensor:
+        if (
+            output is linear
+            or consumer.op != "call_function"
+            or consumer.target is not torch.ops.aten.add.Tensor
+        ):
             continue
 
-        a2a_fqn = a2a.meta.get("custom", {}).get(_MODULE_FQN, "")
-        linear_fqn = linear.meta.get("custom", {}).get(_MODULE_FQN, "")
-        output_fqn = output.meta.get("custom", {}).get(_MODULE_FQN, "")
-        consumer_fqn = consumer.meta.get("custom", {}).get(_MODULE_FQN, "")
-        if not a2a_fqn or not (
-            a2a_fqn == linear_fqn == output_fqn
-            and a2a_fqn.startswith(consumer_fqn + ".")
+        layer_id = _get_layer_id(a2a)
+        if layer_id == _NOT_IN_LAYERS or any(
+            _get_layer_id(node) != layer_id for node in (linear, output, consumer)
         ):
             continue
 
