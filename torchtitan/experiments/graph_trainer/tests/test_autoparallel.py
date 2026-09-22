@@ -736,7 +736,7 @@ def test_autoparallel_eager_sac_requires_a2a_as_linear_activation(a2a_fqn):
     assert nodes.post_wo.meta["recompute"] is CheckpointPolicy.PREFER_RECOMPUTE
 
 
-@pytest.mark.parametrize("node_name", ["a2a", "wo", "post_wo", "residual_add"])
+@pytest.mark.parametrize("node_name", ["a2a", "wo", "residual_add"])
 def test_autoparallel_eager_sac_rejects_missing_layer_metadata(node_name):
     from torchtitan.experiments.graph_trainer.memory_policy import (
         _find_autoparallel_a2a_linear_save_nodes,
@@ -746,6 +746,20 @@ def test_autoparallel_eager_sac_rejects_missing_layer_metadata(node_name):
     getattr(nodes, node_name).meta["custom"].pop(_MODULE_FQN)
 
     assert _find_autoparallel_a2a_linear_save_nodes(gm) == set()
+
+
+def test_autoparallel_eager_sac_allows_missing_view_metadata():
+    from torchtitan.experiments.graph_trainer.memory_policy import (
+        _find_autoparallel_a2a_linear_save_nodes,
+    )
+
+    gm, nodes = _build_autoparallel_a2a_linear_graph(a2a_fqn="layers.0.attention")
+    nodes.post_wo.meta["custom"].pop(_MODULE_FQN)
+
+    assert _find_autoparallel_a2a_linear_save_nodes(gm) == {
+        nodes.a2a,
+        nodes.post_wo,
+    }
 
 
 @pytest.mark.parametrize("node_name", ["a2a", "wo", "post_wo", "residual_add"])

@@ -432,7 +432,7 @@ def _find_autoparallel_a2a_linear_save_nodes(
 
         layer_id = _get_layer_id(a2a)
         if layer_id == _NOT_IN_LAYERS or any(
-            _get_layer_id(node) != layer_id for node in (linear, output, consumer)
+            _get_layer_id(node) != layer_id for node in (linear, consumer)
         ):
             continue
 
