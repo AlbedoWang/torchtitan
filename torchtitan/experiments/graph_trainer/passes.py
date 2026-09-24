@@ -70,6 +70,7 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import (
     get_transformer_block_bucket_counts,
     joint_transformer_block_bucketing_reordering_pass,
     reassign_collective_pgs_pass,
+    reorder_hsdp_grad_collectives_pass,
     schedule_fsdp_comms_to_dense_regions_pass,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
@@ -136,6 +137,31 @@ def _tensor_parallel_degree(config, parallel_dims=None) -> int:
     if parallel_dims is not None and hasattr(parallel_dims, "tp"):
         return int(parallel_dims.tp)
     return int(getattr(config.parallelism, "tensor_parallel_degree", 1))
+
+
+def _data_parallel_degrees(config, parallel_dims=None) -> tuple[int, int]:
+    if parallel_dims is not None and all(
+        hasattr(parallel_dims, name) for name in ("dp_replicate", "dp_shard")
+    ):
+        return int(parallel_dims.dp_replicate), int(parallel_dims.dp_shard)
+    parallelism = config.parallelism
+    return (
+        int(getattr(parallelism, "data_parallel_replicate_degree", 1)),
+        int(getattr(parallelism, "data_parallel_shard_degree", 1)),
+    )
+
+
+def _data_parallel_group_names(parallel_dims) -> tuple[str, str]:
+    shard_axis = (
+        "dp_shard"
+        if getattr(parallel_dims, "spmd_backend", "default")
+        in ("full_dtensor", "spmd_types")
+        else "fsdp"
+    )
+    return (
+        parallel_dims.get_mesh("dp_replicate").get_group().group_name,
+        parallel_dims.get_mesh(shard_axis).get_group().group_name,
+    )
 
 
 def compile_time_passes(
@@ -272,6 +298,28 @@ def compile_time_passes(
         passes.append(isolate_ep_process_group_pass)
         passes.append(eliminate_dead_code_pass)
 
+    dp_replicate_group_name: str | None = None
+    dp_replicate_degree, dp_shard_degree = _data_parallel_degrees(config, parallel_dims)
+    if dp_replicate_degree > 1 and (dp_shard_degree > 1 or dp_shard_degree == -1):
+        if parallel_dims is None:
+            logger.warning(
+                "Skipping HSDP collective reordering because the configured "
+                "process groups are unavailable"
+            )
+        else:
+            dp_replicate_group_name, dp_shard_group_name = _data_parallel_group_names(
+                parallel_dims
+            )
+            passes.append(
+                functools.partial(
+                    reorder_hsdp_grad_collectives_pass,
+                    dp_replicate_degree=dp_replicate_degree,
+                    dp_shard_degree=dp_shard_degree,
+                    dp_replicate_group_name=dp_replicate_group_name,
+                    dp_shard_group_name=dp_shard_group_name,
+                )
+            )
+
     if config.compile.enable_fsdp_ag_rs_overlap:
         passes.append(reassign_collective_pgs_pass)
     if config.compile.enable_autoparallel:
@@ -287,6 +335,7 @@ def compile_time_passes(
                 fsdp_param_module_order=get_fsdp_param_module_order(
                     traced_result.state_fqns
                 ),
+                dp_replicate_group_name=dp_replicate_group_name,
             )
         )
 
