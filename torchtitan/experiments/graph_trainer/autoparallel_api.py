@@ -15,6 +15,7 @@ from autoparallel.api import AutoParallel
 from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
 from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
 from autoparallel.graph_passes.auto_bucketing import (
+    _runtime_estimation_ms,
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
 )
@@ -64,6 +65,10 @@ def _autoparallel_inductor_configs(
         "aten_distributed_optimizations.collective_bucketing": True,
         "aten_distributed_optimizations.insert_overlap_deps": False,
         "aten_distributed_optimizations.max_compute_pre_fetch": 10,
+        # Inductor's own overlap pass uses the same AP estimates as the AP pass.
+        "aten_distributed_optimizations.custom_runtime_estimation": partial(
+            _runtime_estimation_ms, autobucketing_config.custom_runtime_estimation
+        ),
         "reorder_for_peak_memory": False,
         "reorder_for_compute_comm_overlap": False,
         "post_grad_custom_post_pass": partial(
