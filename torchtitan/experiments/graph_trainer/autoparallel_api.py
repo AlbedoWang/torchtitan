@@ -62,7 +62,7 @@ def _autoparallel_inductor_configs(
     return {
         "aten_distributed_optimizations.enable_overlap_scheduling": True,
         "aten_distributed_optimizations.collective_bucketing": True,
-        "aten_distributed_optimizations.insert_overlap_deps": True,
+        "aten_distributed_optimizations.insert_overlap_deps": False,
         "aten_distributed_optimizations.max_compute_pre_fetch": 10,
         "reorder_for_peak_memory": False,
         "reorder_for_compute_comm_overlap": False,
