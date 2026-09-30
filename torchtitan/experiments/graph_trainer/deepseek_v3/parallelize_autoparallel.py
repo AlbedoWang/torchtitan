@@ -200,7 +200,6 @@ def parallelize_autoparallel_deepseekv3(
         ap_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
-        dynamic=True,
         solver=compile_config.autoparallel_solver,
     )
 
