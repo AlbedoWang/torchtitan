@@ -110,18 +110,12 @@ def test_autoparallel_integration_matrix():
     assert all(test.ngpu == 4 for tests in suites.values() for test in tests)
 
 
-def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
-    from torchtitan.experiments.graph_trainer import passes
-
-    traced_result = SimpleNamespace(
-        gm=torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph()),
-        state_fqns=[],
-    )
-    config = SimpleNamespace(
+def _pass_selection_config(**compile_kwargs):
+    return SimpleNamespace(
         compile=GraphTrainerCompileConfig(
             enable_autoparallel=True,
             enable_async_tensor_parallel=False,
-            disable_passes=["cuda_graph_pass"],
+            **compile_kwargs,
         ),
         model=SimpleNamespace(layers=[object()]),
         parallelism=SimpleNamespace(
@@ -130,13 +124,59 @@ def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
         ),
     )
 
-    graph_passes = passes.construct_default_graph_passes(traced_result, config)
+
+def _traced_result():
+    return SimpleNamespace(
+        gm=torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph()),
+        state_fqns=[],
+    )
+
+
+def test_autoparallel_regional_pass_selection_uses_auto_bucketing():
+    from torchtitan.experiments.graph_trainer import passes
+
+    config = _pass_selection_config(
+        inductor_compilation="regional",
+        disable_passes=["cuda_graph_pass"],
+    )
+
+    graph_passes = passes.construct_default_graph_passes(_traced_result(), config)
     pass_fns = [getattr(pass_fn, "func", pass_fn) for pass_fn in graph_passes]
 
     assert passes.tag_with_memory_policy_pass in pass_fns
     assert passes.selective_activation_remat_pass in pass_fns
     assert passes.apply_cpu_offload_pass in pass_fns
-    assert passes.joint_transformer_block_bucketing_reordering_pass in pass_fns
+    assert passes.autobucketing_reordering_pass in pass_fns
+    assert passes.joint_transformer_block_bucketing_reordering_pass not in pass_fns
+
+
+def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
+    from torchtitan.experiments.graph_trainer import passes
+
+    config = _pass_selection_config(
+        inductor_compilation="full",
+        disable_passes=["cuda_graph_pass"],
+    )
+
+    graph_passes = passes.construct_default_graph_passes(
+        _traced_result(), config, parallelism_context=_FakeParallelismContext()
+    )
+    pass_fns = [getattr(pass_fn, "func", pass_fn) for pass_fn in graph_passes]
+
+    assert passes.autobucketing_reordering_pass not in pass_fns
+    assert passes.joint_transformer_block_bucketing_reordering_pass not in pass_fns
+    assert pass_fns[-1] is passes.full_inductor_compilation_pass
+    configs = graph_passes[-1].keywords["inductor_configs"]
+    assert configs["aten_distributed_optimizations.enable_overlap_scheduling"] is True
+    assert configs["aten_distributed_optimizations.collective_bucketing"] is True
+    assert configs["aten_distributed_optimizations.insert_overlap_deps"] is False
+    assert configs["aten_distributed_optimizations.max_compute_pre_fetch"] == 10
+    assert configs["aten_distributed_optimizations.compute_overlap_multipler"] == 0.5
+    assert configs["reorder_for_peak_memory"] is False
+    assert configs["reorder_for_compute_comm_overlap"] is False
+    custom_pass = configs["post_grad_custom_post_pass"]
+    assert custom_pass.func.__name__ == "aten_autobucketing_reordering_pass"
+    assert custom_pass.keywords["configs"].custom_runtime_estimation is not None
 
 
 @pytest.mark.parametrize(
