@@ -14,6 +14,7 @@ graph_trainer trace and compile the placed model through its normal
 
 import logging
 import time
+from pathlib import Path
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -133,15 +134,38 @@ def parallelize_autoparallel_llama(
         dense_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
+        solver=compile_config.autoparallel_solver,
+        strategy_radius=(0 if compile_config.autoparallel_placements_load_path else 2),
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints([x_sharding, x_sharding])
         autop.add_output_constraints([output_sharding])
 
-        t0 = time.time()
-        sharding_placement = autop.optimize_placement(verbose=False)
-        t1 = time.time()
-        logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
+        if compile_config.autoparallel_placements_load_path:
+            sharding_placement = autop.sharding_optimizer.load_placements(
+                compile_config.autoparallel_placements_load_path
+            )
+            logger.info(
+                "Loaded AutoParallel placements from %s",
+                compile_config.autoparallel_placements_load_path,
+            )
+        else:
+            t0 = time.time()
+            sharding_placement = autop.optimize_placement(verbose=False)
+            t1 = time.time()
+            logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
+
+            if compile_config.autoparallel_placements_save_path:
+                save_path = Path(compile_config.autoparallel_placements_save_path)
+                if (
+                    not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                ):
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    autop.sharding_optimizer.save_placements(save_path)
+                    logger.info("Saved AutoParallel placements to %s", save_path)
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
 
         model_output = (
             AutoParallelModelOutput(

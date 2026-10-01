@@ -183,6 +183,7 @@ def parallelize_autoparallel_deepseekv3(
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
         dynamic=True,
+        solver=compile_config.autoparallel_solver,
     )
 
     annotate_deepseekv3_for_graph_trainer(autop.model)

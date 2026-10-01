@@ -234,6 +234,57 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Use AutoParallelGraph (ILP solver-based SPMD sharding) instead of
     manual TP/FSDP/EP."""
 
+    use_autoparallel_defaults: bool = True
+    """Use the validated GraphTrainer compiler defaults with AutoParallel.
+
+    Disable this only when explicitly configuring an alternative AutoParallel
+    compiler or pass setup.
+    """
+
+    autoparallel_solver: Literal["ilp", "approx", "lp"] = "ilp"
+    """Placement solver used by AutoParallel."""
+
+    autoparallel_placements_save_path: str = ""
+    """Save solved AutoParallel placements to this JSON path."""
+
+    autoparallel_placements_load_path: str = ""
+    """Load AutoParallel placements from this JSON path and skip solving."""
+
+    def __post_init__(self) -> None:
+        CompileConfig.__post_init__(self)
+        validate_autoparallel_config(self)
+        if not (self.enable_autoparallel and self.use_autoparallel_defaults):
+            return
+
+        self.backend = "aot_eager"
+        self.memory_policy = "eager"
+        self.pass_pipeline = "default"
+        self.inductor_compilation = "full"
+        self.numerics_changing_optim = False
+        self.enable_fsdp_ag_rs_overlap = False
+        self.enable_fsdp_dense_region_overlap = False
+        if "cuda_graph_pass" not in self.disable_passes:
+            self.disable_passes = [*self.disable_passes, "cuda_graph_pass"]
+
+
+def validate_autoparallel_config(
+    compile_config: GraphTrainerCompileConfig,
+) -> None:
+    if (
+        compile_config.autoparallel_placements_save_path
+        and compile_config.autoparallel_placements_load_path
+    ):
+        raise ValueError(
+            "AutoParallel placement save and load paths are mutually exclusive"
+        )
+    if not compile_config.enable_autoparallel and (
+        compile_config.autoparallel_placements_save_path
+        or compile_config.autoparallel_placements_load_path
+    ):
+        raise ValueError(
+            "AutoParallel placement paths require compile.enable_autoparallel"
+        )
+
 
 def validate_ep_overlap_config(
     ep_overlap_config: EpOverlapConfig,

@@ -186,6 +186,13 @@ Inductor compilation, CUDA graph compatibility checks, and any other enabled
 GraphTrainer passes. This keeps AutoParallel placement composable with the same
 compiler options used by manually parallelized GraphTrainer models.
 
+`GraphTrainerCompileConfig(enable_autoparallel=True)` also selects the
+validated AutoParallel compiler setup in `__post_init__`: `aot_eager` loss
+compile backend, eager-equivalent SAC, the default pass pipeline, full Inductor
+compilation, and no CUDA graph pass. Pass `use_autoparallel_defaults=False` to
+opt out. Setting `enable_autoparallel` on an existing config does not rerun
+`__post_init__`, so it keeps the config's current compiler settings.
+
 AutoParallel can choose different sharding, collective schedules, and operator
 lowerings from the manual parallelization path. This can change numerics, so
 AutoParallel numerics tests check tight agreement with the eager baseline rather
