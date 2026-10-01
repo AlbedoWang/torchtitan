@@ -70,6 +70,7 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import (
     get_transformer_block_layer_ids,
     joint_transformer_block_bucketing_reordering_pass,
     reassign_collective_pgs_pass,
+    reorder_hsdp_grad_collectives_pass,
     schedule_fsdp_comms_to_dense_regions_pass,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
@@ -234,6 +235,41 @@ def compile_time_passes(
         passes.append(isolate_ep_process_group_pass)
         passes.append(eliminate_dead_code_pass)
 
+    # AutoParallel graphs reduce gradients on AutoParallel's own mesh groups,
+    # not on the SimpleFSDP meshes this reordering matches.
+    dp_replicate_group_name: str | None = None
+    if not config.compile.enable_autoparallel:
+        if parallelism_context is None:
+            if getattr(config.parallelism, "data_parallel_replicate_degree", 1) > 1:
+                logger.warning(
+                    "Skipping HSDP collective reordering because the configured "
+                    "process groups are unavailable"
+                )
+        elif (
+            parallelism_context.dp_replicate_enabled
+            and parallelism_context.fsdp_enabled
+        ):
+            # Same meshes as apply_simple_fsdp's HSDP mesh: the gradient RS runs
+            # on the flattened dp_shard x cp group and the AR on dp_replicate.
+            from torchtitan.experiments.graph_trainer.common_utils import (
+                get_simple_fsdp_mesh,
+            )
+
+            dp_replicate_mesh = parallelism_context.get_optional_mesh(
+                "dp_replicate", include_singleton_axes=True
+            )
+            fsdp_mesh = get_simple_fsdp_mesh(parallelism_context)
+            dp_replicate_group_name = dp_replicate_mesh.get_group().group_name
+            passes.append(
+                functools.partial(
+                    reorder_hsdp_grad_collectives_pass,
+                    dp_replicate_degree=dp_replicate_mesh.size(),
+                    dp_shard_degree=fsdp_mesh.size(),
+                    dp_replicate_group_name=dp_replicate_group_name,
+                    dp_shard_group_name=fsdp_mesh.get_group().group_name,
+                )
+            )
+
     if config.compile.enable_fsdp_ag_rs_overlap:
         passes.append(reassign_collective_pgs_pass)
     if config.compile.enable_autoparallel:
@@ -249,6 +285,7 @@ def compile_time_passes(
                 fsdp_param_module_order=get_fsdp_param_module_order(
                     traced_result.state_fqns
                 ),
+                dp_replicate_group_name=dp_replicate_group_name,
             )
         )
 
