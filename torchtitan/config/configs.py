@@ -213,7 +213,8 @@ class ParallelismConfig:
     context_parallel_load_balancer: str | None = "headtail"
     """
     Load balancer type for context parallelism. Options:
-    - "headtail": Use HeadTailLoadBalancer for SDPA
+    - "headtail": Use HeadTailLoadBalancer (not for default-backend SDPA,
+      whose Ulysses CP needs None)
     - "ptrr": Use PTRRLoadBalancer for FlexAttention
     - None: Disable load balancing
     """

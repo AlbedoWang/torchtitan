@@ -46,7 +46,11 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.models.common.attention import (
+    FlexAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
@@ -311,6 +315,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # loss, dataloader, …) are built later in __init__.
         if config.override.imports:
             apply_overrides(config.override, config)
+
+        # Default-backend SDPA CP runs Ulysses all-to-all on full sequences
+        # (apply_cp_to_forward), so inputs must stay contiguous.
+        if (
+            parallel_dims.cp_enabled
+            and config.parallelism.spmd_backend == "default"
+            and config.parallelism.context_parallel_load_balancer is not None
+            and isinstance(model_config, Decoder.Config)
+            and isinstance(
+                getattr(model_config.first_attention, "inner_attention", None),
+                ScaledDotProductAttention.Config,
+            )
+        ):
+            raise ValueError(
+                "SDPA context parallelism uses Ulysses all-to-all and needs "
+                "contiguous sequence shards. Set "
+                "--parallelism.context_parallel_load_balancer None."
+            )
 
         logger.info(f"Building {model_spec.name} {model_spec.flavor}")
 

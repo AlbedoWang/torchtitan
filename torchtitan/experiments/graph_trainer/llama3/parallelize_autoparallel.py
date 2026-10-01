@@ -16,7 +16,9 @@ import time
 from pathlib import Path
 
 import torch
-from autoparallel import ForwardInputs, make_context_parallel
+import torch.nn.functional as F
+from autoparallel import context_parallel_attention_placements, ForwardInputs
+from autoparallel.collectives import all_to_all, local_map
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
@@ -24,6 +26,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.context_parallel.api import _ulysses_attention
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.autoparallel_api import (
     AutoParallelGraph,
@@ -73,7 +76,13 @@ def _build_autoparallel_mesh(parallel_dims: ParallelDims):
 
 
 def _apply_autoparallel_context_parallel_attention(model, dense_mesh) -> None:
-    """Use AutoParallel's CP-aware SDPA while preserving Llama's BLNH API."""
+    """Run Llama's SDPA as Ulysses CP inside an AutoParallel local_map (BLNH)."""
+    placements = context_parallel_attention_placements(dense_mesh)
+    cp_degree = dense_mesh["cp"].size()
+
+    def cp_all_to_all(x):
+        return all_to_all(x, None, None, "cp")
+
     for layer in model.layers.values():
         attention = layer.attention
         inner_attention = attention.inner_attention
@@ -82,15 +91,30 @@ def _apply_autoparallel_context_parallel_attention(model, dense_mesh) -> None:
                 "AutoParallel Llama context parallelism currently requires SDPA"
             )
 
-        cp_attention = make_context_parallel(
-            dense_mesh,
-            kind="sdpa",
-            is_causal=True,
-            scale=attention.scaling,
-            enable_gqa=attention.enable_gqa,
-        )
+        def make_forward(expected_scale, expected_enable_gqa):
+            def sdpa_BLNH(q_BLNH, k_BLNH, v_BLNH):
+                return F.scaled_dot_product_attention(
+                    q_BLNH.transpose(1, 2),
+                    k_BLNH.transpose(1, 2),
+                    v_BLNH.transpose(1, 2),
+                    is_causal=True,
+                    scale=expected_scale,
+                    enable_gqa=expected_enable_gqa,
+                ).transpose(1, 2)
 
-        def make_forward(cp_attention, expected_scale, expected_enable_gqa):
+            def ulysses_body(q_BLNH, k_BLNH, v_BLNH):
+                return _ulysses_attention(
+                    sdpa_BLNH, q_BLNH, k_BLNH, v_BLNH, cp_all_to_all, cp_degree
+                )
+
+            cp_attention = local_map(
+                ulysses_body,
+                out_placements=placements.out_placements,
+                in_placements=placements.in_placements,
+                redistribute_inputs=True,
+                device_mesh=dense_mesh,
+            )
+
             def forward(
                 q_BLNH,
                 k_BLNH,
@@ -116,15 +140,11 @@ def _apply_autoparallel_context_parallel_attention(model, dense_mesh) -> None:
                         "AutoParallel context-parallel SDPA runtime options must "
                         "match the options captured during model construction"
                     )
-                q_BNLH, k_BNLH, v_BNLH = (
-                    tensor.transpose(1, 2) for tensor in (q_BLNH, k_BLNH, v_BLNH)
-                )
-                return cp_attention(q_BNLH, k_BNLH, v_BNLH).transpose(1, 2)
+                return cp_attention(q_BLNH, k_BLNH, v_BLNH)
 
             return forward
 
         inner_attention.forward = make_forward(
-            cp_attention,
             attention.scaling,
             attention.enable_gqa,
         )

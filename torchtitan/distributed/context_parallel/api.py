@@ -4,17 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental._attention import (
     _context_parallel_shard,
-    _enable_context_parallel_dispatcher,
     _HeadTailLoadBalancer,
     _PTRRLoadBalancer,
 )
@@ -44,7 +43,8 @@ def apply_cp_to_forward(
     The attention type is inferred via isinstance on the first module.
 
     TODO: This is a temporary workaround that manually allgathers K/V
-    (FlexAttention) or wraps inputs as CP-sharded DTensors (SDPA).
+    (FlexAttention) or runs Ulysses all-to-all (SDPA, which needs
+    ``context_parallel_load_balancer=None``).
     Once all models adopt config-based sharding with full DTensor,
     CP redistribution should be expressed declaratively via
     ShardingConfig and this function should be removed.
@@ -78,23 +78,19 @@ def apply_cp_to_forward(
             mod.forward = _make_cp_forward(original_forward, cp_mesh)
 
     elif isinstance(first, ScaledDotProductAttention):
-        _enable_context_parallel_dispatcher()
-
         for mod in attention_modules:
             original_forward = mod.forward
 
             def _make_cp_forward(orig_fn, mesh):
-                placement = [Shard(1)]
+                pg_name = dist._get_process_group_name(mesh.get_group())
+
+                def cp_all_to_all(x):
+                    return all_to_all_single(x, None, None, pg_name)
 
                 def cp_forward(q, k, v, **kwargs):
-                    if not isinstance(q, DTensor):
-                        q = DTensor.from_local(q, mesh, placement, run_check=False)
-                    if not isinstance(k, DTensor):
-                        k = DTensor.from_local(k, mesh, placement, run_check=False)
-                    if not isinstance(v, DTensor):
-                        v = DTensor.from_local(v, mesh, placement, run_check=False)
-                    output = orig_fn(q, k, v, **kwargs)
-                    return output.to_local() if isinstance(output, DTensor) else output
+                    return _ulysses_attention(
+                        orig_fn, q, k, v, cp_all_to_all, mesh.size(), **kwargs
+                    )
 
                 return cp_forward
 
@@ -109,6 +105,48 @@ def apply_cp_to_forward(
         )
 
     logger.info("Applied Context Parallel (forward wrapping) to the model")
+
+
+def _ulysses_attention(
+    attention_fn: Callable[..., torch.Tensor],
+    q_BLNH: torch.Tensor,
+    k_BLNH: torch.Tensor,
+    v_BLNH: torch.Tensor,
+    all_to_all: Callable[[torch.Tensor], torch.Tensor],
+    cp_degree: int,
+    **kwargs,
+) -> torch.Tensor:
+    """Run ``attention_fn`` with Ulysses context parallelism.
+
+    q/k/v arrive as contiguous sequence shards ``(B, L/cp, N, H)``. An
+    all-to-all over the CP group turns them into head shards
+    ``(B, L, N/cp, H)``, ``attention_fn`` runs on the full sequence, and a
+    second all-to-all restores sequence sharding. ``all_to_all`` exchanges
+    equal dim-0 chunks across the CP group.
+    """
+    for name, x in (("q", q_BLNH), ("k", k_BLNH), ("v", v_BLNH)):
+        if x.shape[2] % cp_degree != 0:
+            raise ValueError(
+                f"Ulysses context parallelism needs the local {name} head count "
+                f"({x.shape[2]}) to be divisible by the CP degree ({cp_degree})."
+            )
+
+    def seq_to_heads(x):
+        b, s, n, h = x.shape
+        x = x.view(b, s, cp_degree, n // cp_degree, h).movedim(2, 0).contiguous()
+        x = all_to_all(x)
+        return x.movedim(0, 1).reshape(b, cp_degree * s, n // cp_degree, h)
+
+    def heads_to_seq(x):
+        b, s, n, h = x.shape
+        x = x.view(b, cp_degree, s // cp_degree, n, h).movedim(1, 0).contiguous()
+        x = all_to_all(x)
+        return x.movedim(0, 2).reshape(b, s // cp_degree, cp_degree * n, h)
+
+    out = attention_fn(
+        seq_to_heads(q_BLNH), seq_to_heads(k_BLNH), seq_to_heads(v_BLNH), **kwargs
+    )
+    return heads_to_seq(out)
 
 
 def prepare_context_parallel_input(
