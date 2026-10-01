@@ -469,7 +469,7 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
     assert configs["aten_distributed_optimizations.enable_overlap_scheduling"] is True
     assert configs["aten_distributed_optimizations.collective_bucketing"] is True
     assert configs["aten_distributed_optimizations.insert_overlap_deps"] is False
-    assert configs["aten_distributed_optimizations.max_compute_pre_fetch"] == 20
+    assert configs["aten_distributed_optimizations.max_compute_pre_fetch"] == 10
     assert configs["reorder_for_peak_memory"] is False
     assert configs["reorder_for_compute_comm_overlap"] is False
     custom_pass = configs["post_grad_custom_post_pass"]
