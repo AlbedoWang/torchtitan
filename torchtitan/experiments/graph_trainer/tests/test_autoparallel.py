@@ -18,6 +18,7 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 
 class _FakeMesh:
     def __init__(self, mesh_axis_names, size=2):
+        self.device_type = "cpu"
         self.mesh_dim_names = tuple(mesh_axis_names)
         self.ndim = len(self.mesh_dim_names)
         self._size = size
@@ -177,6 +178,46 @@ def test_autoparallel_full_pass_selection_injects_backend_inductor_configs():
     custom_pass = configs["post_grad_custom_post_pass"]
     assert custom_pass.func.__name__ == "aten_autobucketing_reordering_pass"
     assert custom_pass.keywords["configs"].custom_runtime_estimation is not None
+
+
+def test_autoparallel_graph_preserves_copied_model_fqns():
+    from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4, bias=False, device="meta")
+
+        def forward(self, x):
+            return self.linear(x).relu()
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Block()])
+
+        def forward(self, x):
+            return self.layers[0](x)
+
+    autop = AutoParallelGraph(
+        Model(),
+        lambda: (torch.randn(2, 4),),
+        _FakeMesh(("dp_shard",), size=1),
+    )
+    with autop.fake_mode:
+        x = torch.empty(2, 4)
+        traced = minimal_fx_tracer(
+            lambda input_: autop.model(input_), module=autop.model
+        )(x)
+
+    fqns = {
+        custom["module_fqn"]
+        for node in traced.gm.graph.nodes
+        if (custom := node.meta.get("custom")) and "module_fqn" in custom
+    }
+    assert "layers.0" in fqns
+    assert "layers.0.linear" in fqns
 
 
 @pytest.mark.parametrize(
