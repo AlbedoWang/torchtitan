@@ -6,7 +6,6 @@
 
 """AutoParallel helpers for graph_trainer's ``aot_fx_trace`` path."""
 
-from dataclasses import dataclass
 from functools import partial
 
 import torch
@@ -29,13 +28,6 @@ from torch.export._tree_utils import reorder_kwargs
 
 from torchtitan.experiments.graph_trainer.common_utils import annotate_module_fqns
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-
-
-@dataclass(frozen=True)
-class AutoParallelModelOutput:
-    output_mesh: DeviceMesh
-    output_placements: tuple
-    sharded_output_axis: int
 
 
 def _autoparallel_inductor_configs(mesh: DeviceMesh) -> dict:
@@ -91,34 +83,6 @@ def _get_raw_module_tensor(
     return tensor
 
 
-def _contiguous_stride(shape: torch.Size) -> tuple[int, ...]:
-    stride = []
-    running = 1
-    for size in reversed(shape):
-        stride.append(running)
-        running *= size
-    return tuple(reversed(stride))
-
-
-def _wrap_autoparallel_output(
-    output: torch.Tensor,
-    model_output: AutoParallelModelOutput | None,
-) -> torch.Tensor:
-    if model_output is None:
-        return output
-    output_shape = list(output.shape)
-    output_shape[model_output.sharded_output_axis] *= model_output.output_mesh.size()
-    output_shape = torch.Size(output_shape)
-    return DTensor.from_local(
-        output,
-        device_mesh=model_output.output_mesh,
-        placements=model_output.output_placements,
-        run_check=False,
-        shape=output_shape,
-        stride=_contiguous_stride(output_shape),
-    )
-
-
 class AutoParallelGraph(AutoParallel):
     """AutoParallel variant for graph_trainer's ``aot_fx_trace`` pipeline."""
 
@@ -131,13 +95,11 @@ class AutoParallelGraph(AutoParallel):
         sharding_placement=None,
         *,
         compile_config: GraphTrainerCompileConfig,
-        model_output: AutoParallelModelOutput | None = None,
     ) -> nn.Module:
         """Return an AOT-backed parallel module for graph_trainer tracing.
 
-        This keeps loss in graph_trainer's normal train step. The optional output
-        adapter is only needed when the local AutoParallel output must re-enter
-        PyTorch as a DTensor, e.g. vocab-sharded Llama logits for loss_parallel().
+        This keeps loss in graph_trainer's normal train step, which consumes
+        the local AutoParallel outputs as plain tensors.
         """
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
@@ -189,7 +151,7 @@ class AutoParallelGraph(AutoParallel):
             else:
                 output = parallel_model_fn([*params, *flat_args])
             del params
-            return _wrap_autoparallel_output(output, model_output)
+            return output
 
         return make_parallel_module(
             self.model,

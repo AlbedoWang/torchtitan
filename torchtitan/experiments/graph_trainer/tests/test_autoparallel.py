@@ -478,7 +478,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
     if model_name == "llama":
         from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
 
-        model = SimpleNamespace(config=SimpleNamespace(vocab_size=16))
+        model = SimpleNamespace(config=SimpleNamespace(vocab_size=16), layers={})
         parallelism_context = _FakeParallelismContext()
         call_parallelize = parallelize_autoparallel.parallelize_autoparallel_llama
         extra_patches = ()
@@ -520,6 +520,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
             compile_config=compile_config,
             ac_config=object(),
             dump_folder="",
+            max_num_documents=1,
         )
 
     autop = _FakeAutoParallelGraph.instances[0]
@@ -559,13 +560,14 @@ def test_llama_autoparallel_placements_load_or_save(tmp_path, use_saved_placemen
         ),
     ):
         parallelize_autoparallel.parallelize_autoparallel_llama(
-            SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
+            SimpleNamespace(config=SimpleNamespace(vocab_size=16), layers={}),
             parallelism_context=_FakeParallelismContext(),
             training=_training_config(),
             parallelism=ParallelismConfig(),
             compile_config=compile_config,
             ac_config=object(),
             dump_folder="",
+            max_num_documents=1,
         )
 
     autop = _FakeAutoParallelGraph.instances[0]

@@ -161,6 +161,7 @@ def _common_setup(config):
         compile_config=compile_config,
         ac_config=config.activation_checkpoint,
         dump_folder=config.dump_folder,
+        max_num_documents=config.dataloader.max_num_documents,
     )
 
     # CooR must be disabled during init_weights because DTensor RNG ops

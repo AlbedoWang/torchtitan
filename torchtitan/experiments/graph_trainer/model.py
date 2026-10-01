@@ -39,8 +39,9 @@ class GraphTrainerModel:
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
         skip_dp: bool = False,
+        max_num_documents: int | None = None,
     ):
-        del ac_config
+        del ac_config, max_num_documents
         if skip_dp:
             raise ValueError("GraphTrainer models do not support skip_dp=True.")
         if (

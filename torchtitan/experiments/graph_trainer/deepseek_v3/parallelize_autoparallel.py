@@ -98,6 +98,7 @@ def parallelize_autoparallel_deepseekv3(
     compile_config: GraphTrainerCompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    max_num_documents: int | None = None,
 ):
     """Apply AutoParallelGraph SPMD sharding to DeepSeek V3.
 

@@ -339,14 +339,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             del model
         else:
             if not create_seed_checkpoint:
-                model = model.parallelize(
-                    parallelism_context=self.parallelism_context,
-                    training=config.training,
-                    parallelism=config.parallelism,
-                    compile_config=compile_config,
-                    ac_config=config.activation_checkpoint,
-                    dump_folder=self.output_dir,
-                )
+                model = self._parallelize_model(model, compile_config=compile_config)
             self.model_parts = [model]
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
@@ -378,6 +371,24 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         logger.info(
             f"Model {type(self.model_config).__qualname__} size: "
             f"{self.model_param_count:,} total parameters"
+        )
+
+    def _parallelize_model(
+        self,
+        model: BaseModel,
+        *,
+        compile_config: CompileConfig | None,
+        **kwargs: Any,
+    ) -> BaseModel:
+        """Apply non-PP parallelism; subclasses may pass engine-owned kwargs."""
+        return model.parallelize(
+            parallelism_context=self.parallelism_context,
+            training=self.config.training,
+            parallelism=self.config.parallelism,
+            compile_config=compile_config,
+            ac_config=self.config.activation_checkpoint,
+            dump_folder=self.output_dir,
+            **kwargs,
         )
 
     def _initialize_optim(self) -> None:

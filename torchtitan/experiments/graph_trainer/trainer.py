@@ -85,6 +85,18 @@ class GraphTrainingEngine(TrainingEngine):
         )
         self._pinned_pool_ctx = None
 
+    def _parallelize_model(
+        self, model: BaseModel, *, compile_config, **kwargs: Any
+    ) -> BaseModel:
+        # AutoParallel traces with the fixed-shape varlen metadata the runtime
+        # builds from max_num_documents.
+        return super()._parallelize_model(
+            model,
+            compile_config=compile_config,
+            max_num_documents=self.max_num_documents,
+            **kwargs,
+        )
+
     def _initialize_forward_backward(self) -> None:
         if self.config.parallelism.fsdp_defer_gradient_reduction:
             raise ValueError(
