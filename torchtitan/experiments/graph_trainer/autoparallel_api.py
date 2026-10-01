@@ -64,7 +64,13 @@ def _autoparallel_inductor_configs(
         "aten_distributed_optimizations.enable_overlap_scheduling": True,
         "aten_distributed_optimizations.collective_bucketing": True,
         "aten_distributed_optimizations.insert_overlap_deps": False,
-        "aten_distributed_optimizations.max_compute_pre_fetch": 10,
+        # The prefetch window counts compute nodes; 2x the previous 10 because
+        # compute_overlap_multipler below halves what each one can hide.
+        "aten_distributed_optimizations.max_compute_pre_fetch": 20,
+        # The AP estimates are optimistic on H100 (Muse Glimmer 4x8x2 fsdp
+        # reduce-scatter: estimated comm/compute ratio ~0.6x of measured), so
+        # only half of each compute estimate counts toward hiding a collective.
+        "aten_distributed_optimizations.compute_overlap_multipler": 0.5,
         # Inductor's own overlap pass uses the same AP estimates as the AP pass.
         "aten_distributed_optimizations.custom_runtime_estimation": partial(
             _runtime_estimation_ms, autobucketing_config.custom_runtime_estimation
