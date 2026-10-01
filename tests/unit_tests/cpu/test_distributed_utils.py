@@ -5,13 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    with_comms,
+)
 from torch.utils.checkpoint import checkpoint
 
 from torchtitan.config import CommConfig
@@ -334,3 +340,67 @@ def test_dense_sp_state_compiles_with_checkpoint() -> None:
         sparse_mesh=None,
         dense_sp_enabled=False,
     )
+
+
+class TestSetPgTimeouts(DTensorTestBase):
+    @property
+    def world_size(self):
+        return 8
+
+    def _set_timeouts(self, **degrees) -> tuple[ParallelismContext, list]:
+        timeout = timedelta(minutes=30)
+        with (
+            patch(
+                "torchtitan.distributed.parallelism_context.device_type",
+                self.device_type,
+            ),
+            patch("torchtitan.distributed.utils.torch.distributed.barrier"),
+            patch("torchtitan.distributed.utils.device_module.current_device"),
+            patch("torchtitan.distributed.utils.device_module.synchronize"),
+            patch(
+                "torchtitan.distributed.utils.torch.distributed.set_timeout"
+            ) as set_timeout,
+        ):
+            parallelism_context = ParallelismContext(
+                pp=1,
+                world_size=8,
+                enable_sequence_parallel=False,
+                **degrees,
+            )
+            dist_utils.set_pg_timeouts(timeout, parallelism_context)
+        assert all(c.args[0] == timeout for c in set_timeout.call_args_list)
+        return parallelism_context, [c.args[1] for c in set_timeout.call_args_list]
+
+    def _assert_covers_once(self, parallelism_context, groups, mesh_axes):
+        one_dimensional_groups = [
+            mesh.get_group()
+            for mesh in parallelism_context.get_all_one_dimensional_meshes().values()
+        ]
+        mesh_groups = parallelism_context.get_mesh(mesh_axes).get_all_groups()
+        # These axes own process groups that the 1-D meshes do not cover.
+        assert any(
+            not any(group is g for g in one_dimensional_groups)
+            for group in mesh_groups
+        )
+        for group in [*one_dimensional_groups, *mesh_groups]:
+            assert sum(group is g for g in groups) == 1
+        assert groups[-1] is None
+        assert all(dist.get_backend(g) != "fake" for g in groups[:-1])
+
+    @with_comms
+    def test_includes_dense_storage_mesh_groups_once(self):
+        parallelism_context, groups = self._set_timeouts(
+            dp_replicate=2, dp_shard=1, cp=2, tp=2, ep=1
+        )
+        self._assert_covers_once(
+            parallelism_context, groups, ["dp_replicate", "dp_shard", "cp", "tp"]
+        )
+
+    @with_comms
+    def test_includes_sparse_mesh_groups_once(self):
+        parallelism_context, groups = self._set_timeouts(
+            dp_replicate=2, dp_shard=2, cp=1, tp=2, ep=2
+        )
+        self._assert_covers_once(
+            parallelism_context, groups, ["dp_replicate", "edp_shard", "ep"]
+        )

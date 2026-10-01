@@ -571,7 +571,7 @@ def set_pg_timeouts(
     parallelism_context: ParallelismContext,
 ):
     """
-    Sets the timeout for all PGs in the provided mesh, and the default (world) group.
+    Sets the timeout for all PGs in the provided meshes, and the default (world) group.
 
     Note: synchronizes via a barrier, before changing the timeouts. This is important, because
     otherwise you may face a race where the slow rank has not reached the timeout reduction point
@@ -588,12 +588,29 @@ def set_pg_timeouts(
     torch.distributed.barrier(device_ids=[device_module.current_device()])
     device_module.synchronize()
 
-    # None represents the 'default' PG, not part of the mesh
+    # None represents the 'default' PG, not part of the meshes.
     groups: list[torch.distributed.ProcessGroup | None] = [
         mesh.get_group()
         for mesh in parallelism_context.get_all_one_dimensional_meshes().values()
-    ] + [None]
+    ]
+    # The dense storage mesh and the sparse mesh are separate unflattens of the
+    # world mesh, so their axes own process groups that the one-dimensional
+    # meshes above do not cover (e.g. cp/tp of the mesh AutoParallel uses).
+    for axes in (
+        ["dp_replicate", "dp_shard", "cp", "tp"],
+        ["dp_replicate", "edp_shard", "ep"],
+    ):
+        mesh = parallelism_context.get_activated_mesh(axes)
+        if mesh is not None:
+            groups.extend(mesh.get_all_groups())
+    groups.append(None)
+
+    unique_groups: list[torch.distributed.ProcessGroup | None] = []
     for group in groups:
+        if not any(group is existing_group for existing_group in unique_groups):
+            unique_groups.append(group)
+
+    for group in unique_groups:
         torch.distributed.set_timeout(timeout, group)
 
 
