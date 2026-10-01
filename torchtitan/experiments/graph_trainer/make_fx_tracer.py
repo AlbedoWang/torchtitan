@@ -254,6 +254,30 @@ def _check_optimizer_has_module(
         )
 
 
+def _preserve_module_state_aliases(
+    module: nn.Module, model_state: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Restore parameter/buffer aliases after subclass rewrapping.
+
+    A tied tensor appears once per FQN in ``model_state``.  Tensor subclasses
+    are unwrapped and rewrapped independently by the tracer, so two FQNs that
+    referred to the same DTensor can otherwise become distinct DTensor objects.
+    Reuse the first traced value for every FQN that aliases the same live module
+    tensor, matching the module state that was originally extracted.
+    """
+    original_state = extract_module_state(module)
+    traced_value_by_original_id: dict[int, torch.Tensor] = {}
+    aliased_state = model_state.copy()
+    for name, original_value in original_state.items():
+        if name not in model_state:
+            continue
+        original_id = id(original_value)
+        if original_id not in traced_value_by_original_id:
+            traced_value_by_original_id[original_id] = model_state[name]
+        aliased_state[name] = traced_value_by_original_id[original_id]
+    return aliased_state
+
+
 @contextlib.contextmanager
 def _reparametrize_train_state(
     module: nn.Module | None,
@@ -263,6 +287,8 @@ def _reparametrize_train_state(
 ):
     """Reparametrize module and optimizer with explicit tensor state for tracing."""
     with contextlib.ExitStack() as stack:
+        if module is not None:
+            model_state = _preserve_module_state_aliases(module, model_state)
         if optimizer is not None:
             # swap_in pairs values positionally in optimizer.param_groups flat
             # order, which differs from named_parameters() order for bucketed
@@ -282,7 +308,9 @@ def _reparametrize_train_state(
                 )
             )
         if module is not None:
-            stack.enter_context(stateless._reparametrize_module(module, model_state))
+            stack.enter_context(
+                stateless._reparametrize_module(module, model_state, tie_weights=True)
+            )
         yield
 
 
