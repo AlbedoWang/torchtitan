@@ -61,7 +61,10 @@ def _autoparallel_inductor_configs(
     autobucketing_config.save_trace = False
 
     return {
-        "aten_distributed_optimizations.enable_overlap_scheduling": True,
+        # Experiment: no Inductor overlap pass (pass 2); the AP pass below
+        # still reorders and buckets. Ring attention traces per-CP-rank
+        # graphs, and pass 2 on them diverges the mesh_cp collective order.
+        "aten_distributed_optimizations.enable_overlap_scheduling": False,
         "aten_distributed_optimizations.collective_bucketing": True,
         "aten_distributed_optimizations.insert_overlap_deps": False,
         "aten_distributed_optimizations.max_compute_pre_fetch": 10,
