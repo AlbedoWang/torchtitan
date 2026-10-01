@@ -14,9 +14,12 @@ graph_trainer trace and compile the placed model through its normal
 
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
+import torch_remat as remat
 from autoparallel import collectives, ForwardInputs
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -30,16 +33,93 @@ from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.models.common.activation import BinaryActivationFn
 from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     VarlenInnerAttention,
     VarlenMetadata,
 )
+from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 from torchtitan.tools.utils import device_type
 
 
 logger = logging.getLogger(__name__)
+
+
+class SplitFeedForward(Module):
+    """SwiGLU feed-forward with separate ``[F, D]`` gate (w1) and up (w3) weights.
+
+    ``FeedForward`` stores gate/up as one ``[2, F, D]`` ``w13`` read through a
+    flattened view. The solver cannot keep that weight sharded on F through the
+    view, and sharding the size-2 stack dim instead pads it unevenly over tp,
+    which makes rank graphs differ. Separate weights restore the
+    column-parallel FFN. ``w1``/``w3`` are the logical keys the state-dict
+    adapters already use, so HF checkpoints map onto them directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        w1: Linear,
+        w3: Linear,
+        w2: Linear,
+        activation_fn: BinaryActivationFn,
+        gate_up_init: Callable[[torch.Tensor], None] | None,
+    ):
+        super().__init__()
+        self.w1 = w1
+        self.w3 = w3
+        self.w2 = w2
+        self.activation_fn = activation_fn
+        self._gate_up_init = gate_up_init
+
+    @classmethod
+    def from_fused(cls, feed_forward: FeedForward) -> "SplitFeedForward":
+        w13 = feed_forward.w13
+        if w13.bias is not None:
+            raise ValueError("SplitFeedForward does not support a w13 bias")
+        _, hidden_dim, dim = w13.weight.shape
+        config = Linear.Config(in_features=dim, out_features=hidden_dim)
+        with torch.device(w13.weight.device):
+            w1, w3 = config.build(), config.build()
+        return cls(
+            w1=w1,
+            w3=w3,
+            w2=feed_forward.w2,
+            activation_fn=feed_forward.activation_fn,
+            gate_up_init=(w13._param_init or {}).get("weight"),
+        )
+
+    def _init_self_parameters(self) -> None:
+        # Initialize w1/w3 as the halves of the fused weight they replace.
+        # Without a fused initializer, the Linear default matches the fused one.
+        if self._gate_up_init is None:
+            return
+        with torch.no_grad():
+            gate_up = torch.stack([self.w1.weight, self.w3.weight])
+            self._gate_up_init(gate_up)
+            self.w1.weight.copy_(gate_up[0])
+            self.w3.weight.copy_(gate_up[1])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def gate_up(x, w1, w3):
+            return F.linear(x, w1), F.linear(x, w3)
+
+        gate_TF, up_TF = remat.region(
+            gate_up,
+            self.remat_region_name("w13"),
+            recompute=self.remat_should_recompute("w13"),
+        )(x, self.w1.weight, self.w3.weight)
+        remat.recompute_needs_tensor(gate_TF, up_TF)
+        out_TD = remat.region(
+            self.w2,
+            self.remat_region_name("w2"),
+            recompute=self.remat_should_recompute("w2"),
+        )(self.activation_fn(gate_TF, up_TF))
+        remat.recompute_needs_tensor(out_TD)
+        return out_TD
 
 
 class LocalMapVarlenAttention(Module):
@@ -173,6 +253,7 @@ def parallelize_autoparallel_llama(
             dense_mesh,
             max_seqlen=training.max_context_length,
         )
+        layer.feed_forward = SplitFeedForward.from_fused(layer.feed_forward)
 
     def input_fn():
         # One microbatch, matching what GraphTrainer feeds the module per step.
